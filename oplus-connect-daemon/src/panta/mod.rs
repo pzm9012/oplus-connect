@@ -19,8 +19,9 @@
 //! exchanged in the SCP `SyncSecure` of the *same* connection and the u64s are
 //! little-endian even though they travel big-endian.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use aes_gcm::{
     Aes128Gcm, Nonce,
@@ -33,7 +34,12 @@ use sha2::Sha512;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+use crate::clipboard::oaf::{
+    DEFAULT_CHANNEL_CAPACITY, GrpcCommand, GrpcEvent, GrpcOutput, OafGrpcRoute,
+};
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -44,11 +50,14 @@ const PLATFORM_PC: u8 = 0x01;
 /// Profiles announced in the `0x0008` service list. The Windows sessions
 /// compared on Find X6 Pro advertised these four profiles; clipboard data in
 /// those sessions used the `Oplus_MacConnect` DataBus topic.
-pub const SERVICE_PROFILES: [&str; 4] = [
+pub const SERVICE_PROFILES: [&str; 5] = [
     "system:streamtransfer",
     "system:filetransfer",
     "app:unite.oplus.onet",
     "app:oshare.win.agent",
+    // ColorOS 15 discovers this only when it appears in the initial query.
+    // Peers without the profile simply omit it from their registration.
+    "app:clipboardservice",
 ];
 
 /// The EPI TLV uses the historical value from the official client. It is not
@@ -116,18 +125,23 @@ pub fn decode_transport_header(header: [u8; 2]) -> Option<(u16, u8)> {
     Some((session, control))
 }
 
+#[derive(Clone, Copy)]
+struct ConfirmedBusinessSessions {
+    local: (u16, bool),
+    oshare: (u16, bool),
+    clipboard: (u16, bool),
+}
+
 fn accepts_business_session(
     session: u16,
     peer_sessions: &[u16],
-    local_session: u16,
-    local_session_confirmed: bool,
-    oshare_session: u16,
-    oshare_session_confirmed: bool,
+    confirmed: ConfirmedBusinessSessions,
 ) -> bool {
     session > 4
         && (peer_sessions.contains(&session)
-            || (session == local_session && local_session_confirmed)
-            || (session == oshare_session && oshare_session_confirmed))
+            || (session == confirmed.local.0 && confirmed.local.1)
+            || (session == confirmed.oshare.0 && confirmed.oshare.1)
+            || (session == confirmed.clipboard.0 && confirmed.clipboard.1))
 }
 
 fn configured_session(name: &str) -> Option<u16> {
@@ -440,6 +454,37 @@ pub fn unix_time() -> u64 {
 /// but every frame must advance it: reusing a value makes the receiver treat
 /// the frame as a duplicate and silently discard it.
 static DBR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Per-frame delivery sequence for encrypted business frames. The phone's DBS
+/// receiver expects `[transport][u16 sequence][0x04][u64 seed][cipher]` and
+/// drops frames whose sequence is outside its receive window, so this cannot
+/// be omitted even though the ciphertext is self-describing.
+///
+/// Entries are dropped when their gRPC route closes (`forget_delivery_sequence`).
+/// Even if one is missed the map stays bounded: session ids come from
+/// [`allocate_session_id`], so at most 1019 keys can exist.
+static DBR_DELIVERY_SEQUENCE: LazyLock<Mutex<HashMap<u16, u16>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Locks the delivery-sequence map, recovering from a poisoned mutex: the value
+/// is a counter, so a panic elsewhere must not take the whole session down.
+fn delivery_sequences() -> std::sync::MutexGuard<'static, HashMap<u16, u16>> {
+    DBR_DELIVERY_SEQUENCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn next_delivery_sequence(session_id: u16) -> u16 {
+    let mut sequences = delivery_sequences();
+    let next = sequences.entry(session_id).or_insert(0);
+    let value = *next;
+    *next = value.wrapping_add(1);
+    value
+}
+
+/// Drops the counter of a session whose route has closed.
+fn forget_delivery_sequence(session_id: u16) {
+    delivery_sequences().remove(&session_id);
+}
 
 fn next_dbr_sequence() -> u64 {
     let mut previous = DBR_SEQUENCE.load(Ordering::Relaxed);
@@ -617,6 +662,62 @@ pub fn build_data_bus_with(
     out
 }
 
+/// Plaintext OAF body shape for the clipboard gRPC channel: one type byte, then
+/// the `ICDF` byte string. The phone's `ICDF.PacketAssemble` rejects the DBS
+/// business envelope on this channel (`invalid msg header flag`), so the routed
+/// gRPC session must stay unsealed.
+fn build_grpc_oaf_frame(session_id: u16, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(3 + payload.len());
+    body.extend_from_slice(&encode_transport_header(session_id, 0));
+    body.push(0x00);
+    body.extend_from_slice(payload);
+    if body.len() > u16::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OAF gRPC frame too large",
+        ));
+    }
+    Ok(body)
+}
+
+/// Seals a gRPC `ICDF` payload with the same AES-128-GCM business framing used
+/// by incoming phone frames. DBS happens to tolerate plaintext PC output, but
+/// the official OAF SDK encrypts service-channel writes.
+fn seal_grpc_oaf_frame(
+    session_id: u16,
+    payload: &[u8],
+    ksc: Option<&[u8]>,
+    client_rc2: &[u8; 8],
+    server_rc2: &[u8; 8],
+) -> std::io::Result<Vec<u8>> {
+    let sequence = next_dbr_sequence();
+    let (key, iv, aad) = business_key(ksc, client_rc2, server_rc2, &sequence.to_be_bytes())
+        .ok_or_else(|| std::io::Error::other("missing clipboard business key"))?;
+    let cipher = Aes128Gcm::new_from_slice(&key).expect("AES-128 key");
+    let encrypted = cipher
+        .encrypt(
+            &Nonce::from(iv),
+            aes_gcm::aead::Payload {
+                msg: payload,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| std::io::Error::other("cannot seal clipboard gRPC frame"))?;
+    let mut body = Vec::with_capacity(13 + encrypted.len());
+    body.extend_from_slice(&encode_transport_header(session_id, 0));
+    body.extend_from_slice(&next_delivery_sequence(session_id).to_be_bytes());
+    body.push(0x04);
+    body.extend_from_slice(&sequence.to_be_bytes());
+    body.extend_from_slice(&encrypted);
+    if body.len() > u16::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OAF gRPC frame too large",
+        ));
+    }
+    Ok(body)
+}
+
 /// Windows publishes these notification-control messages after topic sync;
 /// their order activates the phone's notification publisher for this peer.
 fn notification_startup_messages() -> [String; 3] {
@@ -643,12 +744,14 @@ async fn send_data_bus_handshake(
     session_id: u16,
     our_id: [u8; 6],
     peer_id: [u8; 6],
+    topics: &BusTopics,
 ) -> std::io::Result<()> {
     let our_hex = crate::net_utils::pdid();
-    let frames = data_bus_handshake_frames(
+    let frames = data_bus_handshake_frames_with_topics(
         &our_hex,
         pc_device_name(),
         CapabilityOverrides::from_process_env(),
+        topics,
     );
     for (route_head, json) in frames {
         let frame = build_data_bus_with(session_id, our_id, peer_id, route_head, &json);
@@ -661,14 +764,36 @@ async fn send_data_bus_handshake(
     Ok(())
 }
 
+async fn send_clipboard_icdf(
+    sock: &mut TcpStream,
+    session_id: u16,
+    our_id: [u8; 6],
+    peer_id: [u8; 6],
+    status: &str,
+) -> std::io::Result<()> {
+    let json = topic_data_json(CLIPBOARD_ICDF_TOPIC, &clipboard_icdf_message(status));
+    let frame = build_data_bus_with(session_id, our_id, peer_id, 0x52, &json);
+    write_frame(sock, &frame).await
+}
+
+#[cfg(test)]
 fn data_bus_handshake_frames(
     our_hex: &str,
     device_name: &str,
     overrides: CapabilityOverrides,
 ) -> [(u8, String); 11] {
+    data_bus_handshake_frames_with_topics(our_hex, device_name, overrides, &BusTopics::default())
+}
+
+fn data_bus_handshake_frames_with_topics(
+    our_hex: &str,
+    device_name: &str,
+    overrides: CapabilityOverrides,
+    topics: &BusTopics,
+) -> [(u8, String); 11] {
     [
         (0x03, link_info_json(our_hex, device_name)),
-        (0x2a, OFFICIAL_WINDOWS_TOPIC_SYNC_JSON.to_string()),
+        (0x2a, topics.sync_json()),
         (0x51, SCREEN_STATUS_JSON.to_string()),
         (
             0x52,
@@ -773,6 +898,7 @@ struct BusTopics {
     kms: bool,
     cast: bool,
     expand_cast: bool,
+    clipboard_icdf: bool,
 }
 
 impl BusTopics {
@@ -792,6 +918,29 @@ impl BusTopics {
                     topics.push(serde_json::json!({"dbs_topic_name":name,"dbs_topic_tag":0}));
                 }
             }
+        }
+        if self.clipboard_icdf {
+            value["dbs_msg_payload"]["pub"]
+                .as_array_mut()
+                .expect("topic array")
+                .push(serde_json::json!({
+                    "dbs_topic_name": CLIPBOARD_ICDF_TOPIC,
+                    "dbs_topic_tag": 0,
+                }));
+            value["dbs_msg_payload"]["sub"]
+                .as_array_mut()
+                .expect("topic array")
+                .push(serde_json::json!({
+                    "dbs_topic_name": CLIPBOARD_ICDF_TOPIC,
+                    "dbs_topic_tag": 0,
+                }));
+            value["dbs_msg_payload"]["sub"]
+                .as_array_mut()
+                .expect("topic array")
+                .push(serde_json::json!({
+                    "dbs_topic_name": CLIPBOARD_ICDF_SUBSCRIBE_TOPIC,
+                    "dbs_topic_tag": 0,
+                }));
         }
         value.to_string()
     }
@@ -1711,6 +1860,48 @@ pub fn topic_data_json(topic: &str, payload_json: &str) -> String {
     value.to_string()
 }
 
+/// ColorOS 15 clipboard ICDF initialization topic published by the PC.
+pub const CLIPBOARD_ICDF_TOPIC: &str = "Oplus_HeySynergy_PadConnect_CastMaterial";
+/// ColorOS 15 phone-to-PC control topic that carries `IcdfStatus`.
+const CLIPBOARD_ICDF_SUBSCRIBE_TOPIC: &str = "Oplus_PcConnect";
+
+/// Official Windows `NotifyPhoneInitIcdf` serializes a `List<DataBusMessage>`
+/// (`[JsonProperty("key")]`/`[JsonProperty("value")]`) and publishes it as a
+/// single DBS data message on the CastMaterial topic. The phone's
+/// `CastMaterialReadRunnable` parses that string as a JSON array; publishing
+/// one `{key,value}` object per message makes Gson throw and crash-loops
+/// `com.oplus.linker`, so a single array payload is required.
+fn clipboard_icdf_message(status: &str) -> String {
+    serde_json::json!([
+        {"key": "TaskType", "value": "ACROSS_DEVICE_CLIPBOARD"},
+        {"key": "IcdfStatus", "value": status},
+    ])
+    .to_string()
+}
+
+/// Reads `IcdfStatus` from either the official array payload or a single
+/// key/value object. The envelope remains the normal DBS topic-data shape.
+fn icdf_status(body: &[u8]) -> Option<String> {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&body[payload_json_start(body)?..]).ok()?;
+    if envelope["dbs_msg_type"] != "msg_normal_topic_data" {
+        return None;
+    }
+    let payload: serde_json::Value = match &envelope["dbs_msg_payload"] {
+        serde_json::Value::String(text) => serde_json::from_str(text).ok()?,
+        value => value.clone(),
+    };
+    let messages: Vec<&serde_json::Value> = match &payload {
+        serde_json::Value::Array(messages) => messages.iter().collect(),
+        value => vec![value],
+    };
+    messages
+        .into_iter()
+        .find(|message| message["key"] == "IcdfStatus")
+        .and_then(|message| message["value"].as_str())
+        .map(str::to_string)
+}
+
 /// Capability advertisement (`pcAbility`) aligned with the Windows sessions
 /// compared against Find X6 Pro on 2026-11-19. OSVersion is local configuration,
 /// not necessarily the OS version reported in those captures.
@@ -1843,11 +2034,252 @@ const PEER_SERVICE_AGENT: u16 = 0x8357;
 const LOCAL_INITIATOR_AGENT: u16 = 0x7c88;
 const LOCAL_SERVICE_AGENT: u16 = 0x18be;
 
-/// The official PC also registers the oshare (sharing/clipboard) profile and its
+/// Official PC also registers the oshare (sharing/clipboard) profile and its
 /// `WinChannelService` agent after the initial profile bind; clipboard traffic is
 /// addressed to that agent. Verbatim from the capture.
 const OSHARE_SERVICE_LIST: &str = "0008010200000000016170703a6f73686172652e77696e2e6167656e743b";
 const OSHARE_REGISTER: &str = "0008020200000000000157696e4368616e6e656c536572766963653b3b00011e986170703a6f73686172652e77696e2e6167656e743b010001000a";
+
+/// ColorOS 15 clipboard profile. It is negotiated only after the phone has
+/// advertised it, so ColorOS 16/17 keep the original four-profile service list.
+pub use crate::clipboard::oaf::CLIPBOARD_SERVICE_PROFILE;
+const LOCAL_CLIPBOARD_CONSUMER_AGENT: u16 = 0x1e97;
+const LOCAL_CLIPBOARD_PROVIDER_AGENT: u16 = 0x1e96;
+const CLIPBOARD_SERVICE_CAPABILITIES: [u8; 5] = [0x01, 0x00, 0x05, 0x00, 0x0a];
+const CLIPBOARD_PROVIDER_CAPABILITIES: [u8; 5] = [0x01, 0x00, 0x04, 0x00, 0x0a];
+/// `IcdfStatus=Init` retries before the phone's clipboard engine gives up.
+const CLIPBOARD_ICDF_INIT_ATTEMPTS: u8 = 8;
+/// Delay before the first `IcdfStatus=Init` and between retries.
+const CLIPBOARD_ICDF_INIT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Delay after a failed Init before the next attempt.
+const CLIPBOARD_ICDF_INIT_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+/// Settle time before asking the phone for its clipboard service session.
+const CLIPBOARD_SESSION_REQUEST_DELAY: std::time::Duration = std::time::Duration::from_secs(4);
+/// Default `IcdfStatus=Ready` poll interval while the DBS clipboard path is off.
+const CLIPBOARD_READY_REPEAT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Ready poll interval for a phone that never answered `IcdfStatus=Init`: keep
+/// the nudge (it is what makes the phone push its clipboard) but stop filling
+/// the link with one message every two seconds forever.
+const CLIPBOARD_READY_REPEAT_SLOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// Grace period before the first clipboard RPC after the gRPC route is ready.
+const CLIPBOARD_RPC_GRACE: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// One service group in a PC `0x0008 sub=0x02` registration. The official
+/// frame repeats `serviceName;; NUL count (agent u16, profile ';' caps[5])*`
+/// per group (see `PROFILE_REGISTRATION`); omitting `count` shifts every
+/// following byte and the phone silently drops the whole group, which made
+/// `findPeer(app:clipboardservice)` return 10002.
+fn push_registration_entry(
+    out: &mut Vec<u8>,
+    service_name: &str,
+    agent: u16,
+    profile: &str,
+    capabilities: [u8; 5],
+) {
+    out.extend_from_slice(service_name.as_bytes());
+    out.push(0);
+    out.push(0x01);
+    out.extend_from_slice(&agent.to_be_bytes());
+    out.extend_from_slice(profile.as_bytes());
+    out.push(b';');
+    out.extend_from_slice(&capabilities);
+}
+
+/// `0x0008 sub=0x02` registration for the two clipboard roles. Handles are local
+/// namespaces; the peer learns them from this frame before creating a service.
+fn clipboard_profile_registration() -> Vec<u8> {
+    let mut out = vec![0x00, 0x08, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02];
+    push_registration_entry(
+        &mut out,
+        "ClipboardConsumer;;",
+        LOCAL_CLIPBOARD_CONSUMER_AGENT,
+        CLIPBOARD_SERVICE_PROFILE,
+        CLIPBOARD_SERVICE_CAPABILITIES,
+    );
+    push_registration_entry(
+        &mut out,
+        "ClipBoardProvider;;",
+        LOCAL_CLIPBOARD_PROVIDER_AGENT,
+        CLIPBOARD_SERVICE_PROFILE,
+        CLIPBOARD_PROVIDER_CAPABILITIES,
+    );
+    out
+}
+
+/// `0x0008 sub=0x01` selection sent only after the phone advertises clipboard.
+fn clipboard_service_selection() -> Vec<u8> {
+    let mut out = vec![0x00, 0x08, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    out.extend_from_slice(CLIPBOARD_SERVICE_PROFILE.as_bytes());
+    out.push(b';');
+    out
+}
+
+fn clipboard_service_request(peer_provider_agent: u16, session_id: u16) -> Vec<u8> {
+    create_service_request(
+        peer_provider_agent,
+        LOCAL_CLIPBOARD_CONSUMER_AGENT,
+        CLIPBOARD_SERVICE_PROFILE,
+        session_id,
+        104,
+    )
+}
+
+/// Opens the OAF stream for the clipboard session we initiate. The phone's own
+/// clipboard client sends `[transport(control=1)][01 00 00]` immediately after
+/// its create-service request; its `OafCommonChannelServer` only creates the
+/// netty channel — and therefore the `GrpcServerTransport` that routes incoming
+/// gRPC — once that frame arrives. Without it the provider logs `accept` and
+/// then stays silent forever.
+async fn open_clipboard_oaf_stream(sock: &mut TcpStream, session: u16) -> std::io::Result<()> {
+    let mut frame = encode_transport_header(session, 1).to_vec();
+    frame.extend_from_slice(&[0x01, 0x00, 0x00]);
+    write_frame(sock, &frame).await
+}
+
+/// Asks the phone to open a clipboard service session and immediately opens the
+/// OAF stream for it. Both frames are required: without the stream-open control
+/// frame the phone's provider never builds its `GrpcServerTransport`.
+async fn request_clipboard_session(
+    sock: &mut TcpStream,
+    peer_agent: u16,
+    session: u16,
+) -> std::io::Result<()> {
+    let request = clipboard_service_request(peer_agent, session);
+    write_frame(sock, &request).await?;
+    open_clipboard_oaf_stream(sock, session).await
+}
+
+/// `0x0008 sub=0x03` bind for one local clipboard role. The official unite
+/// initiator bind uses the same shape, so send one frame per registered agent.
+fn clipboard_profile_bind_entry(service_name: &str, agent: u16, capabilities: [u8; 5]) -> Vec<u8> {
+    let mut out = vec![
+        0x00, 0x08, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+    ];
+    out.extend_from_slice(service_name.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&agent.to_be_bytes());
+    out.extend_from_slice(CLIPBOARD_SERVICE_PROFILE.as_bytes());
+    out.push(b';');
+    out.extend_from_slice(&capabilities);
+    out
+}
+
+fn clipboard_profile_binds() -> [Vec<u8>; 2] {
+    [
+        clipboard_profile_bind_entry(
+            "ClipboardConsumer;;",
+            LOCAL_CLIPBOARD_CONSUMER_AGENT,
+            CLIPBOARD_SERVICE_CAPABILITIES,
+        ),
+        clipboard_profile_bind_entry(
+            "ClipBoardProvider;;",
+            LOCAL_CLIPBOARD_PROVIDER_AGENT,
+            CLIPBOARD_PROVIDER_CAPABILITIES,
+        ),
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredService {
+    service_name: String,
+    agent: u16,
+    profile: String,
+    capabilities: [u8; 5],
+}
+
+/// Parses the repeated entries in `0x0008 sub=0x02`. Unlike the historical
+/// `agent_for_profile` helper this preserves role/order and all handles for a
+/// profile, which clipboard needs because provider and consumer are distinct.
+fn parse_registered_services(body: &[u8]) -> Option<Vec<RegisteredService>> {
+    if body.len() < 10 || body[..3] != [0x00, 0x08, 0x02] {
+        return None;
+    }
+    let mut cursor = 10;
+    let mut services = Vec::new();
+    match body[3] {
+        // PC registration: `serviceName;;` NUL count, then count entries of
+        // (agent u16, profile ';', capabilities[5]).
+        0x02 => {
+            let group_count = u16::from_be_bytes([body[8], body[9]]) as usize;
+            for _ in 0..group_count {
+                let name_end = body.get(cursor..)?.iter().position(|byte| *byte == 0)? + cursor;
+                let service_name = std::str::from_utf8(&body[cursor..name_end])
+                    .ok()?
+                    .to_string();
+                cursor = name_end + 1;
+                let count = *body.get(cursor)? as usize;
+                cursor += 1;
+                for _ in 0..count {
+                    let agent = u16::from_be_bytes([*body.get(cursor)?, *body.get(cursor + 1)?]);
+                    cursor += 2;
+                    let profile_end =
+                        body.get(cursor..)?.iter().position(|byte| *byte == b';')? + cursor;
+                    let profile = std::str::from_utf8(&body[cursor..profile_end])
+                        .ok()?
+                        .to_string();
+                    cursor = profile_end + 1;
+                    let capabilities: [u8; 5] = body.get(cursor..cursor + 5)?.try_into().ok()?;
+                    cursor += 5;
+                    services.push(RegisteredService {
+                        service_name: service_name.clone(),
+                        agent,
+                        profile,
+                        capabilities,
+                    });
+                }
+            }
+        }
+        // Phone registration: app-id/digest groups, each with its own entries.
+        0x03 => {
+            let group_count = u16::from_be_bytes([body[8], body[9]]) as usize;
+            for _ in 0..group_count {
+                let app_end = body.get(cursor..)?.iter().position(|byte| *byte == 0)? + cursor;
+                let service_name = std::str::from_utf8(&body[cursor..app_end])
+                    .ok()?
+                    .to_string();
+                cursor = app_end + 1;
+                let count = *body.get(cursor)? as usize;
+                cursor += 1;
+                for _ in 0..count {
+                    let agent = u16::from_be_bytes([*body.get(cursor)?, *body.get(cursor + 1)?]);
+                    cursor += 2;
+                    let profile_end =
+                        body.get(cursor..)?.iter().position(|byte| *byte == b';')? + cursor;
+                    let profile = std::str::from_utf8(&body[cursor..profile_end])
+                        .ok()?
+                        .to_string();
+                    cursor = profile_end + 1;
+                    let capabilities: [u8; 5] = body.get(cursor..cursor + 5)?.try_into().ok()?;
+                    cursor += 5;
+                    services.push(RegisteredService {
+                        service_name: service_name.clone(),
+                        agent,
+                        profile,
+                        capabilities,
+                    });
+                }
+            }
+        }
+        _ => return None,
+    }
+    (cursor == body.len()).then_some(services)
+}
+
+fn clipboard_peer_agents(services: &[RegisteredService]) -> Vec<u16> {
+    services
+        .iter()
+        .filter(|service| service.profile == CLIPBOARD_SERVICE_PROFILE)
+        .map(|service| service.agent)
+        .collect()
+}
+
+fn clipboard_peer_provider_agent(services: &[RegisteredService]) -> Option<u16> {
+    services
+        .iter()
+        .filter(|service| service.profile == CLIPBOARD_SERVICE_PROFILE)
+        .find(|service| service.capabilities[2] == CLIPBOARD_PROVIDER_CAPABILITIES[2])
+        .map(|service| service.agent)
+}
 
 /// Persistent RSA-1024 public identity carried by the official PC's
 /// `app:oshare.win.agent` `0x0004 sub=0x06` frame. The phone waits for this
@@ -1900,8 +2332,11 @@ fn append_protocol_log(filename: &str, line: &str) {
 }
 
 async fn write_frame(sock: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    let len = u16::try_from(body.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "OAF frame too large")
+    })?;
     let mut frame = Vec::with_capacity(body.len() + 2);
-    frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(body);
     // Full transcript of what we send, for diffing against a successful
     // Windows session (`/tmp/oppo-bus-tx.log`).
@@ -1990,6 +2425,64 @@ impl Drop for DataSessionGuard {
 }
 
 pub type EventBroadcaster = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrpcRouteRole {
+    Server,
+    Client,
+}
+
+struct GrpcRouteHandle {
+    inbound: mpsc::Sender<Vec<u8>>,
+    commands: Option<mpsc::Sender<GrpcCommand>>,
+    role: GrpcRouteRole,
+}
+
+impl GrpcRouteHandle {
+    fn server(
+        session_id: u16,
+        outbound: mpsc::Sender<GrpcOutput>,
+        events: mpsc::Sender<GrpcEvent>,
+        broadcaster: Option<EventBroadcaster>,
+    ) -> Self {
+        let (inbound_tx, inbound_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        tokio::spawn(OafGrpcRoute::start_server(
+            inbound_rx,
+            outbound,
+            events,
+            broadcaster,
+            session_id,
+        ));
+        Self {
+            inbound: inbound_tx,
+            commands: None,
+            role: GrpcRouteRole::Server,
+        }
+    }
+
+    fn client(
+        session_id: u16,
+        outbound: mpsc::Sender<GrpcOutput>,
+        events: mpsc::Sender<GrpcEvent>,
+        broadcaster: Option<EventBroadcaster>,
+    ) -> Self {
+        let (inbound_tx, inbound_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        let (commands_tx, commands_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        tokio::spawn(OafGrpcRoute::start_client(
+            inbound_rx,
+            outbound,
+            commands_rx,
+            events,
+            broadcaster,
+            session_id,
+        ));
+        Self {
+            inbound: inbound_tx,
+            commands: Some(commands_tx),
+            role: GrpcRouteRole::Client,
+        }
+    }
+}
 
 pub async fn serve_with_events<F, Fut>(
     sock: TcpStream,
@@ -2080,12 +2573,25 @@ async fn run_session<F, Fut>(
             }
         }
     });
+    let clipboard_session =
+        configured_session("OPLUS_CLIPBOARD_GRPC_SESSION").unwrap_or_else(|| {
+            loop {
+                let candidate = allocate_session_id();
+                if candidate != local_session && candidate != oshare_session {
+                    break candidate;
+                }
+            }
+        });
     let mut peer_sessions: Vec<u16> = Vec::new();
+    let mut peer_clipboard_provider_agent: Option<u16> = None;
     let mut peer_service_agent = PEER_SERVICE_AGENT;
     let mut peer_oshare_agent = PEER_OSHARE_AGENT;
     let mut kms_controller: Option<crate::kms::control::Controller> = None;
     let mut cast_controller: Option<crate::cast::control::Controller> = None;
     let mut expand_cast_controller: Option<crate::expand_cast::control::Controller> = None;
+    // `OPLUS_CLIPBOARD_GRPC=0` keeps the ColorOS 15 gRPC clipboard channel off so
+    // a device that also advertises `app:clipboardservice` stays on the DBS path.
+    let clipboard_grpc_enabled = std::env::var("OPLUS_CLIPBOARD_GRPC").as_deref() != Ok("0");
     let mut bus_topics = BusTopics::default();
     let mut epi_name = String::new();
     let mut epi_type = 0u8;
@@ -2094,6 +2600,53 @@ async fn run_session<F, Fut>(
     let mut local_session_confirmed = false;
     let mut oshare_session_confirmed = false;
     let mut oshare_certificate_sent = false;
+    let mut clipboard_selection_sent = false;
+    let mut clipboard_registration_sent = false;
+    let mut clipboard_agent_answered = false;
+    let mut clipboard_session_requested = false;
+    let mut clipboard_session_confirmed = false;
+    let mut clipboard_client_bound = false;
+    let mut clipboard_client_stream_opened = false;
+    let mut clipboard_provider_session: Option<u16> = None;
+    // Delivery-sequence state for the phone-initiated provider session. The
+    // phone numbers its reliable ICDF frames from 0 and retransmits the same
+    // bytes every 10s until a BlockAck control frame
+    // `[0x02][count][(u16 start, u16 end)…]` advances its window. Ack each
+    // unique message once, in arrival order.
+    // Highest delivery sequence acknowledged on the phone-initiated provider
+    // session. The phone numbers its reliable frames from 0 and only advances
+    // its window on a cumulative BlockAck, so ack `0..=seq` (never a bare
+    // `seq..=seq`, which leaves holes and lets the 10 s retry timer expire).
+    let mut clipboard_provider_acked_seq: Option<u16> = None;
+    let mut clipboard_icdf_init_sent = false;
+    let mut clipboard_icdf_ready = false;
+    let mut clipboard_icdf_attempts = 0u8;
+    let mut next_clipboard_icdf_init = std::time::Instant::now() + CLIPBOARD_ICDF_INIT_DELAY;
+    let mut clipboard_icdf_slow_poll = false;
+    let clipboard_request_at = std::time::Instant::now() + CLIPBOARD_SESSION_REQUEST_DELAY;
+    // The phone only pushes its clipboard after `IcdfStatus=Ready` arrives while
+    // the gRPC channel is up (`FileShareEngineService` dispatches scene 30 →
+    // `ClipBoardDataBusScene.sendClipToRemote`), and it never pushes on its own
+    // clipboard changes. Repeating Ready is the only way to learn that the phone
+    // clipboard moved; the phone dedups with `isClipDataRepeat`, so a steady
+    // poll costs one small DBS message per interval and no repeated payloads.
+    // `OPLUS_CLIPBOARD_READY_REPEAT_SECS=0` disables it, any other value sets the
+    // interval (default 2 s).
+    let clipboard_ready_repeat = match std::env::var("OPLUS_CLIPBOARD_READY_REPEAT_SECS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(seconds) => Some(std::time::Duration::from_secs(seconds)),
+            Err(_) => {
+                warn!("invalid OPLUS_CLIPBOARD_READY_REPEAT_SECS; expected seconds");
+                Some(CLIPBOARD_READY_REPEAT_DEFAULT)
+            }
+        },
+        Err(_) => Some(CLIPBOARD_READY_REPEAT_DEFAULT),
+    };
+    let mut last_clipboard_ready = std::time::Instant::now();
+    // Earliest time the first clipboard RPC may be sent after the gRPC route
+    // becomes ready (see `GrpcEvent::Ready`).
+    let mut clipboard_ready_at: Option<std::time::Instant> = None;
     let mut profiles_answered = false;
     let mut registration_sent = false;
     let our_id = {
@@ -2117,6 +2670,13 @@ async fn run_session<F, Fut>(
     // has activated the channel (`clipboard_state_active` state=1) or reported
     // `switchStatus.Notice_ClipBoard == 1`.
     let mut clipboard_enabled = false;
+    // ColorOS 15 uses a separate gRPC route; its readiness is independent of the
+    // ColorOS 16/17 DBS activation switch.
+    let mut clipboard_grpc_ready = false;
+    let (grpc_outbound_tx, mut grpc_outbound_rx) =
+        mpsc::channel::<GrpcOutput>(DEFAULT_CHANNEL_CAPACITY);
+    let (grpc_events_tx, mut grpc_events_rx) = mpsc::channel::<GrpcEvent>(DEFAULT_CHANNEL_CAPACITY);
+    let mut grpc_routes: HashMap<u16, GrpcRouteHandle> = HashMap::new();
     let mut last_heartbeat = std::time::Instant::now();
     let inject_text = std::env::var("OPLUS_CLIPBOARD_INJECT").ok();
     let inject_session = configured_session("OPLUS_CLIPBOARD_SESSION").unwrap_or(local_session);
@@ -2126,18 +2686,6 @@ async fn run_session<F, Fut>(
         .unwrap_or(8);
     let inject_at = std::time::Instant::now() + std::time::Duration::from_secs(inject_delay);
     let mut injected = false;
-    let inject_text_2 = std::env::var("OPLUS_CLIPBOARD_INJECT_2").ok();
-    let inject_session_2 = std::env::var("OPLUS_CLIPBOARD_SESSION_2")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|value| *value > 4 && *value < 1024)
-        .unwrap_or(777);
-    let inject_delay_2 = std::env::var("OPLUS_CLIPBOARD_INJECT_2_DELAY_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(20);
-    let inject_at_2 = std::time::Instant::now() + std::time::Duration::from_secs(inject_delay_2);
-    let mut injected_2 = false;
     let allow_unconfirmed =
         std::env::var("OPLUS_CLIPBOARD_ALLOW_UNCONFIRMED").as_deref() == Ok("1");
     // A persistent timer must not be reset by incoming network traffic.
@@ -2643,17 +3191,246 @@ async fn run_session<F, Fut>(
                     None => std::future::pending().await,
                 }
             }, if local_session_confirmed && link_info_sent => continue,
+            Some(output) = grpc_outbound_rx.recv() => {
+                if grpc_routes.contains_key(&output.session_id) {
+                    // The phone parses this channel's OAF payload as a plain
+                    // `ICDF` byte string after one type byte: the official
+                    // client writes `[transport][0x00][ICDF…]`. Sealing it with
+                    // the DBS business envelope makes `ICDF.PacketAssemble`
+                    // report `invalid msg header flag` for every frame, so the
+                    // gRPC server never sees HTTP/2 data.
+                    if output.session_id == clipboard_session {
+                        match build_grpc_oaf_frame(output.session_id, &output.bytes) {
+                            Ok(frame) => {
+                                if let Err(error) = write_frame(&mut sock, &frame).await {
+                                    warn!(
+                                        "panta[{}]: cannot write clipboard gRPC session={}: {}",
+                                        peer, output.session_id, error
+                                    );
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    "panta[{}]: cannot frame clipboard gRPC session={}: {}",
+                                    peer, output.session_id, error
+                                );
+                                grpc_routes.remove(&output.session_id);
+                            }
+                        }
+                        continue;
+                    }
+                    match seal_grpc_oaf_frame(
+                        output.session_id,
+                        &output.bytes,
+                        ksc.as_deref(),
+                        &client_rc2,
+                        &server_rc2,
+                    ) {
+                        Ok(frame) => {
+                            if let Err(error) = write_frame(&mut sock, &frame).await {
+                                warn!(
+                                    "panta[{}]: cannot write clipboard gRPC session={}: {}",
+                                    peer, output.session_id, error
+                                );
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                "panta[{}]: cannot frame clipboard gRPC session={}: {}",
+                                peer, output.session_id, error
+                            );
+                            grpc_routes.remove(&output.session_id);
+                        }
+                    }
+                }
+                continue;
+            }
+            Some(event) = grpc_events_rx.recv() => {
+                match event {
+                    GrpcEvent::Ready { session_id } => {
+                        if grpc_routes.get(&session_id).is_some_and(|route| {
+                            route.role == GrpcRouteRole::Client
+                        }) {
+                            clipboard_grpc_ready = true;
+                            clipboard_snapshot = true;
+                            // The phone's provider builds its GrpcServerTransport a
+                            // moment after our create-service confirm. Sending the
+                            // first RPC immediately races that setup and the frames
+                            // are dropped, so hold the snapshot for a short grace
+                            // period.
+                            clipboard_ready_at = Some(std::time::Instant::now() + CLIPBOARD_RPC_GRACE);
+                            info!(
+                                "panta[{}]: clipboard gRPC consumer session={} ready",
+                                peer, session_id
+                            );
+                            // `IcdfStatus=Ready` is sent by the poll below, never
+                            // immediately: ColorOS 16/17 advertise the same
+                            // `app:clipboardservice` profile while their DBS
+                            // clipboard path is the one in use, and each Ready
+                            // makes such a phone push its clipboard again. Restart
+                            // the poll clock so the first Ready goes out only after
+                            // the DBS switch state is known.
+                            last_clipboard_ready = std::time::Instant::now();
+                        }
+                    }
+                    GrpcEvent::RemoteText { session_id, text } => {
+                        if grpc_routes.contains_key(&session_id) {
+                            pending_clipboard = None;
+                            clipboard_baseline = false;
+                            clipboard_snapshot = false;
+                            last_clipboard = Some(text);
+                        }
+                    }
+                    GrpcEvent::Closed { session_id } => {
+                        // The route can already be gone when the failure happened
+                        // in the outbound writer, which removes it so that no
+                        // further output is accepted. Key the reset off the
+                        // session as well, otherwise `clipboard_grpc_ready`
+                        // sticks at true and every later clipboard write is
+                        // silently dropped instead of being reported.
+                        let removed = grpc_routes.remove(&session_id);
+                        if session_id == clipboard_session
+                            || removed.is_some_and(|route| route.role == GrpcRouteRole::Client)
+                        {
+                            clipboard_grpc_ready = false;
+                        }
+                        if clipboard_provider_session == Some(session_id) {
+                            clipboard_provider_session = None;
+                            clipboard_provider_acked_seq = None;
+                        }
+                        forget_delivery_sequence(session_id);
+                        info!(
+                            "panta[{}]: clipboard gRPC route session={} closed",
+                            peer, session_id
+                        );
+                    }
+                }
+                continue;
+            }
             result = read_or_clipboard_tick(&mut sock, &mut clipboard_tick, &mut pending_clipboard, &mut chunk) => result,
         } {
             ClipboardPollResult::Tick => {
                 if let Some(peer_id) = peer_device_id {
+                    let now = std::time::Instant::now();
+                    // A phone that advertises `app:clipboardservice` but never
+                    // answers `IcdfStatus=Init` does not complete this handshake
+                    // (observed on ColorOS 16 with its DBS clipboard off, and once
+                    // on ColorOS 15 after a PC restart). The Ready poll is what
+                    // makes the phone push its clipboard, so it is slowed rather
+                    // than stopped: a revived phone recovers on the next poll.
+                    if !clipboard_icdf_slow_poll
+                        && !clipboard_icdf_ready
+                        && clipboard_icdf_attempts >= CLIPBOARD_ICDF_INIT_ATTEMPTS
+                    {
+                        clipboard_icdf_slow_poll = true;
+                        warn!(
+                            "panta[{}]: phone never answered clipboard IcdfStatus=Init \
+                             ({} attempts); slowing Ready polls to {}s until reconnect",
+                            peer,
+                            clipboard_icdf_attempts,
+                            CLIPBOARD_READY_REPEAT_SLOW.as_secs()
+                        );
+                    }
+                    // Poll only while the DBS clipboard path is unavailable
+                    // (ColorOS 15). Devices that enable DBS clipboard already push
+                    // their clipboard through the data bus, and an extra gRPC push
+                    // per Ready would rewrite the local clipboard every few seconds.
+                    if let Some(interval) = clipboard_ready_repeat.map(|interval| {
+                        if clipboard_icdf_slow_poll {
+                            interval.max(CLIPBOARD_READY_REPEAT_SLOW)
+                        } else {
+                            interval
+                        }
+                    }) && clipboard_grpc_ready
+                        && !clipboard_enabled
+                        && now.duration_since(last_clipboard_ready) >= interval
+                    {
+                        last_clipboard_ready = now;
+                        if let Err(error) =
+                            send_clipboard_icdf(&mut sock, local_session, our_id, peer_id, "Ready")
+                                .await
+                        {
+                            warn!("panta[{}]: cannot repeat clipboard Ready: {}", peer, error);
+                            return;
+                        }
+                        info!(
+                            "panta[{}]: repeated ColorOS 15 clipboard IcdfStatus=Ready",
+                            peer
+                        );
+                    }
+                    if bus_topics.clipboard_icdf
+                        && !clipboard_icdf_ready
+                        && local_session_confirmed
+                        && link_info_sent
+                        && clipboard_icdf_attempts < CLIPBOARD_ICDF_INIT_ATTEMPTS
+                        && now >= next_clipboard_icdf_init
+                    {
+                        if let Err(error) =
+                            send_clipboard_icdf(&mut sock, local_session, our_id, peer_id, "Init")
+                                .await
+                        {
+                            warn!(
+                                "panta[{}]: cannot retry clipboard ICDF Init: {}",
+                                peer, error
+                            );
+                            return;
+                        }
+                        clipboard_icdf_attempts += 1;
+                        next_clipboard_icdf_init = now + CLIPBOARD_ICDF_INIT_RETRY;
+                        info!(
+                            "panta[{}]: retried ColorOS 15 clipboard IcdfStatus=Init ({}/{})",
+                            peer, clipboard_icdf_attempts, CLIPBOARD_ICDF_INIT_ATTEMPTS
+                        );
+                    }
+                    if clipboard_registration_sent
+                        && !clipboard_session_requested
+                        && now >= clipboard_request_at
+                        && let Some(peer_agent) = peer_clipboard_provider_agent
+                    {
+                        if let Err(error) =
+                            request_clipboard_session(&mut sock, peer_agent, clipboard_session)
+                                .await
+                        {
+                            warn!(
+                                "panta[{}]: cannot create delayed clipboard session: {}",
+                                peer, error
+                            );
+                            return;
+                        }
+                        clipboard_session_requested = true;
+                        clipboard_client_stream_opened = true;
+                        info!(
+                            "panta[{}]: requested clipboard gRPC session={} agent={:#06x}->{:#06x} after DBS settle",
+                            peer, clipboard_session, LOCAL_CLIPBOARD_CONSUMER_AGENT, peer_agent
+                        );
+                    }
                     if !injected
                         && inject_text.is_some()
                         && std::time::Instant::now() >= inject_at
-                        && (local_session_confirmed || allow_unconfirmed)
+                        && (local_session_confirmed || clipboard_grpc_ready || allow_unconfirmed)
                     {
                         let text = inject_text.as_deref().unwrap_or_default();
-                        if let Some(frame) = clipboard_data_frame(
+                        if clipboard_grpc_ready {
+                            let queued = grpc_routes
+                                .get(&clipboard_session)
+                                .and_then(|route| route.commands.as_ref())
+                                .is_some_and(|commands| {
+                                    commands
+                                        .try_send(GrpcCommand::SendText(text.to_string()))
+                                        .is_ok()
+                                });
+                            if queued {
+                                injected = true;
+                                info!(
+                                    "panta[{}]: injected clipboard via gRPC session={} ({}B)",
+                                    peer,
+                                    clipboard_session,
+                                    text.len()
+                                );
+                            }
+                        } else if let Some(frame) = clipboard_data_frame(
                             clipboard_enabled,
                             inject_session,
                             our_id,
@@ -2675,36 +3452,13 @@ async fn run_session<F, Fut>(
                             );
                         }
                     }
-                    if !injected_2
-                        && inject_text_2.is_some()
-                        && std::time::Instant::now() >= inject_at_2
-                        && (local_session_confirmed || allow_unconfirmed)
-                    {
-                        let text = inject_text_2.as_deref().unwrap_or_default();
-                        if let Some(frame) = clipboard_data_frame(
-                            clipboard_enabled,
-                            inject_session_2,
-                            our_id,
-                            peer_id,
-                            text,
-                        ) {
-                            let header = encode_transport_header(inject_session_2, 0);
-                            if let Err(error) = write_frame(&mut sock, &frame).await {
-                                warn!("panta[{}]: cannot inject clipboard 2: {}", peer, error);
-                                return;
-                            }
-                            injected_2 = true;
-                            info!(
-                                "panta[{}]: injected clipboard 2 session={} wire={} ({}B)",
-                                peer,
-                                inject_session_2,
-                                hex(&header),
-                                text.len()
-                            );
-                        }
-                    }
                 }
-                if clipboard_enabled && local_session_confirmed && pending_clipboard.is_none() {
+                let clipboard_grace_elapsed =
+                    clipboard_ready_at.is_none_or(|at| std::time::Instant::now() >= at);
+                if ((clipboard_enabled && local_session_confirmed) || clipboard_grpc_ready)
+                    && pending_clipboard.is_none()
+                    && clipboard_grace_elapsed
+                {
                     pending_clipboard = crate::platform::clipboard::request_read();
                 }
                 continue;
@@ -2721,38 +3475,67 @@ async fn run_session<F, Fut>(
                     }
                     continue;
                 }
-                if clipboard_enabled
-                    && local_session_confirmed
-                    && let (Some(peer_id), Some(text)) = (peer_device_id, text)
+                if let Some(text) = text
                     && (clipboard_snapshot
                         || (last_clipboard.as_ref() != Some(&text) && !text.is_empty()))
                 {
-                    let session_id = if std::mem::take(&mut clipboard_snapshot) {
-                        local_session
-                    } else {
-                        std::env::var("OPLUS_CLIPBOARD_SESSION")
-                            .ok()
-                            .and_then(|value| {
-                                u16::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
-                            })
-                            .unwrap_or(local_session)
-                    };
-                    // Clipboard/notification data use the unite session;
-                    // the separate oshare session is for file/share APIs.
-                    if let Some(frame) =
-                        clipboard_data_frame(clipboard_enabled, session_id, our_id, peer_id, &text)
-                    {
-                        if let Err(error) = write_frame(&mut sock, &frame).await {
-                            warn!("panta[{}]: cannot push clipboard: {}", peer, error);
-                            return;
+                    if clipboard_grpc_ready && !(clipboard_enabled && local_session_confirmed) {
+                        let queued = grpc_routes
+                            .get(&clipboard_session)
+                            .and_then(|route| route.commands.as_ref())
+                            .is_some_and(|commands| {
+                                commands
+                                    .try_send(GrpcCommand::SendText(text.to_string()))
+                                    .is_ok()
+                            });
+                        if queued {
+                            clipboard_snapshot = false;
+                            last_clipboard = Some(text);
+                            info!(
+                                "panta[{}]: queued clipboard for gRPC session={} ({}B)",
+                                peer,
+                                clipboard_session,
+                                last_clipboard.as_ref().map_or(0, |text| text.len())
+                            );
+                        } else {
+                            pending_clipboard = crate::platform::clipboard::request_read();
                         }
-                        info!(
-                            "panta[{}]: pushed clipboard on unite={} ({}B)",
-                            peer,
+                    } else if clipboard_enabled
+                        && local_session_confirmed
+                        && let Some(peer_id) = peer_device_id
+                    {
+                        let session_id = if std::mem::take(&mut clipboard_snapshot) {
+                            local_session
+                        } else {
+                            std::env::var("OPLUS_CLIPBOARD_SESSION")
+                                .ok()
+                                .and_then(|value| {
+                                    u16::from_str_radix(value.trim().trim_start_matches("0x"), 16)
+                                        .ok()
+                                })
+                                .unwrap_or(local_session)
+                        };
+                        // Clipboard/notification data use the unite session;
+                        // the separate oshare session is for file/share APIs.
+                        if let Some(frame) = clipboard_data_frame(
+                            clipboard_enabled,
                             session_id,
-                            text.len()
-                        );
-                        last_clipboard = Some(text);
+                            our_id,
+                            peer_id,
+                            &text,
+                        ) {
+                            if let Err(error) = write_frame(&mut sock, &frame).await {
+                                warn!("panta[{}]: cannot push clipboard: {}", peer, error);
+                                return;
+                            }
+                            info!(
+                                "panta[{}]: pushed clipboard on unite={} ({}B)",
+                                peer,
+                                session_id,
+                                text.len()
+                            );
+                            last_clipboard = Some(text);
+                        }
                     }
                 }
                 continue;
@@ -2770,16 +3553,22 @@ async fn run_session<F, Fut>(
         buf.extend_from_slice(&chunk[..read]);
 
         while let Some(body) = take_frame(&mut buf) {
+            append_protocol_log("oppo-bus-rx.log", &hex(&body));
+            let session_hint = decode_transport_header([body[0], body[1]]).map(|(s, _)| s);
             let is_business_frame = body.len() > 11
-                && body[2] & 0x04 != 0
-                && decode_transport_header([body[0], body[1]]).is_some_and(|(session, _)| {
+                && (body[2] & 0x04 != 0
+                    // Sealed business frames carry the 0x04 encryption marker
+                    // after the 2-byte delivery sequence, i.e. at body[4].
+                    || body.get(4) == Some(&0x04))
+                && session_hint.is_some_and(|session| {
                     accepts_business_session(
                         session,
                         &peer_sessions,
-                        local_session,
-                        local_session_confirmed,
-                        oshare_session,
-                        oshare_session_confirmed,
+                        ConfirmedBusinessSessions {
+                            local: (local_session, local_session_confirmed),
+                            oshare: (oshare_session, oshare_session_confirmed),
+                            clipboard: (clipboard_session, clipboard_session_confirmed),
+                        },
                     )
                 });
             match body.first().copied() {
@@ -2941,6 +3730,49 @@ async fn run_session<F, Fut>(
                             peer, peer_oshare_agent
                         );
                     }
+                    if let Some(services) = parse_registered_services(&body) {
+                        let peer_clipboard_agents = clipboard_peer_agents(&services);
+                        // The gRPC clipboard channel only replaces the DBS path when
+                        // the phone actually advertises `app:clipboardservice` and
+                        // the operator has not disabled it. ColorOS 16/17 devices
+                        // that never list the profile keep the untouched DBS path.
+                        let grpc_clipboard =
+                            clipboard_grpc_enabled && !peer_clipboard_agents.is_empty();
+                        if grpc_clipboard
+                            && let Some(provider) = clipboard_peer_provider_agent(&services)
+                        {
+                            peer_clipboard_provider_agent = Some(provider);
+                        }
+                        if grpc_clipboard {
+                            bus_topics.clipboard_icdf = true;
+                            info!(
+                                "panta[{}]: phone clipboard agents={:04x?} provider={:04x?}",
+                                peer, peer_clipboard_agents, peer_clipboard_provider_agent
+                            );
+                        }
+                        if grpc_clipboard && !clipboard_selection_sent {
+                            let mut frames = vec![
+                                clipboard_service_selection(),
+                                clipboard_profile_registration(),
+                            ];
+                            frames.extend(clipboard_profile_binds());
+                            for frame in frames {
+                                if let Err(error) = write_frame(&mut sock, &frame).await {
+                                    warn!(
+                                        "panta[{}]: cannot advertise clipboard profile: {}",
+                                        peer, error
+                                    );
+                                    return;
+                                }
+                            }
+                            clipboard_selection_sent = true;
+                            clipboard_registration_sent = true;
+                            info!(
+                                "panta[{}]: advertised app:clipboardservice (phone agents={:04x?})",
+                                peer, peer_clipboard_agents
+                            );
+                        }
+                    }
                 }
                 Some(0x00) if body.get(1) == Some(&0x08) && body.get(2) == Some(&0x01) => {
                     if profiles_answered {
@@ -2998,6 +3830,15 @@ async fn run_session<F, Fut>(
                             peer, local_session, LOCAL_INITIATOR_AGENT, peer_service_agent
                         );
                     }
+                    if clipboard_registration_sent
+                        && !clipboard_session_requested
+                        && !clipboard_icdf_ready
+                    {
+                        info!(
+                            "panta[{}]: clipboard profile bound; waiting for ICDF Ready",
+                            peer
+                        );
+                    }
                 }
                 Some(0x00) if body.get(1) == Some(&0x10) && body.get(2) == Some(&0x01) => {
                     let Some(entries) = parse_multichannel_request(&body) else {
@@ -3051,15 +3892,105 @@ async fn run_session<F, Fut>(
                     // sessions 1/2/4 are the plaintext OAF control frames.
                     let (session_id, _) =
                         decode_transport_header([body[0], body[1]]).expect("guard checked");
-                    match business_key(ksc.as_deref(), &client_rc2, &server_rc2, &body[3..11]) {
+                    // Two sealed layouts reach this code:
+                    //   legacy DBS:  `[transport][u8 flags(0x04)][u64 seed][cipher]`
+                    //   ColorOS 15:  `[transport][u16 delivery][0x04][u64 seed][cipher]`
+                    // The ColorOS 15 layout carries a 2-byte delivery counter in
+                    // front of the marker, so the marker is at index 4 and the seed
+                    // at 5..13. Matching only the legacy position made every frame
+                    // whose delivery counter was ≥ 0x0100 look like a control frame
+                    // and dropped the phone's copyToClip with a GCM tag mismatch.
+                    let (seq_start, cipher_start) = if body.get(4) == Some(&0x04) {
+                        (5, 13)
+                    } else {
+                        (3, 11)
+                    };
+                    match business_key(
+                        ksc.as_deref(),
+                        &client_rc2,
+                        &server_rc2,
+                        &body[seq_start..cipher_start],
+                    ) {
                         Some((key, iv, aad)) => {
                             let cipher = Aes128Gcm::new_from_slice(&key).expect("AES-128 key");
                             let payload = aes_gcm::aead::Payload {
-                                msg: &body[11..],
+                                msg: &body[cipher_start..],
                                 aad: &aad,
                             };
                             match cipher.decrypt(&Nonce::from(iv), payload) {
                                 Ok(plain) => {
+                                    // Ack the phone's reliable frame with the
+                                    // control payload the SDK parses in
+                                    // `ws/d$a.b`: `02 count (start,end)*`.
+                                    let mut duplicate = false;
+                                    if clipboard_provider_session == Some(session_id) {
+                                        let seq = u16::from_be_bytes([body[2], body[3]]);
+                                        duplicate = clipboard_provider_acked_seq
+                                            .is_some_and(|acked| seq <= acked);
+                                        // `02 01 <start> <end>` acknowledges the
+                                        // delivery sequence of this frame. Re-ack
+                                        // every retransmission: the first ack can
+                                        // race the phone's transport setup, and
+                                        // skipping duplicates lets its 10 s retry
+                                        // timer expire and drop the channel.
+                                        let mut ack =
+                                            encode_transport_header(session_id, 1).to_vec();
+                                        // Observed phone acks are three bytes:
+                                        // `[0x01][seq_hi][seq_lo]`, e.g. `01 00 03`.
+                                        ack.extend_from_slice(&[
+                                            0x01,
+                                            (seq >> 8) as u8,
+                                            (seq & 0xff) as u8,
+                                        ]);
+                                        if let Err(error) = write_frame(&mut sock, &ack).await {
+                                            warn!(
+                                                "panta[{}]: cannot ack clipboard session {} seq {}: {}",
+                                                peer, session_id, seq, error
+                                            );
+                                            return;
+                                        }
+                                        if !duplicate {
+                                            clipboard_provider_acked_seq = Some(seq);
+                                            info!(
+                                                "panta[{}]: acknowledged clipboard session={} seq={}",
+                                                peer, session_id, seq
+                                            );
+                                        }
+                                    }
+                                    if duplicate {
+                                        continue;
+                                    }
+                                    if grpc_routes.contains_key(&session_id) {
+                                        append_protocol_log(
+                                            "oppo-grpc-rx.log",
+                                            &format!(
+                                                "[{}] session={} {}",
+                                                peer,
+                                                session_id,
+                                                hex(&plain)
+                                            ),
+                                        );
+                                        let rejected =
+                                            grpc_routes.get(&session_id).is_some_and(|route| {
+                                                route.inbound.try_send(plain).is_err()
+                                            });
+                                        if rejected {
+                                            if let Some(route) = grpc_routes.remove(&session_id) {
+                                                if route.role == GrpcRouteRole::Client {
+                                                    clipboard_grpc_ready = false;
+                                                } else if clipboard_provider_session
+                                                    == Some(session_id)
+                                                {
+                                                    clipboard_provider_session = None;
+                                                }
+                                            }
+                                            warn!(
+                                                "panta[{}]: clipboard gRPC route session={} backpressure",
+                                                peer, session_id
+                                            );
+                                        }
+                                        continue;
+                                    }
                                     if !link_info_sent
                                         && is_data_bus_hello(&plain)
                                         && let Some(peer_id) = peer_device_id
@@ -3070,6 +4001,7 @@ async fn run_session<F, Fut>(
                                             local_session,
                                             our_id,
                                             peer_id,
+                                            &bus_topics,
                                         )
                                         .await
                                         {
@@ -3084,6 +4016,92 @@ async fn run_session<F, Fut>(
                                                  topic sync, and capability data",
                                             peer
                                         );
+                                        if bus_topics.clipboard_icdf && !clipboard_icdf_init_sent {
+                                            if let Err(error) = send_clipboard_icdf(
+                                                &mut sock,
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                "Init",
+                                            )
+                                            .await
+                                            {
+                                                warn!(
+                                                    "panta[{}]: cannot initialize phone clipboard ICDF: {}",
+                                                    peer, error
+                                                );
+                                                return;
+                                            }
+                                            clipboard_icdf_init_sent = true;
+                                            clipboard_icdf_attempts = 1;
+                                            next_clipboard_icdf_init = std::time::Instant::now()
+                                                + std::time::Duration::from_secs(2);
+                                            info!(
+                                                "panta[{}]: sent ColorOS 15 clipboard IcdfStatus=Init",
+                                                peer
+                                            );
+                                        }
+                                    }
+                                    if let Some(status) = icdf_status(&plain) {
+                                        info!(
+                                            "panta[{}]: ColorOS 15 clipboard IcdfStatus={}",
+                                            peer, status
+                                        );
+                                        if status == "Ready" {
+                                            clipboard_icdf_ready = true;
+                                            if clipboard_registration_sent
+                                                && clipboard_icdf_ready
+                                                && !clipboard_session_requested
+                                                && let Some(peer_agent) =
+                                                    peer_clipboard_provider_agent
+                                            {
+                                                if let Err(error) = request_clipboard_session(
+                                                    &mut sock,
+                                                    peer_agent,
+                                                    clipboard_session,
+                                                )
+                                                .await
+                                                {
+                                                    warn!(
+                                                        "panta[{}]: cannot create clipboard session after ICDF ready: {}",
+                                                        peer, error
+                                                    );
+                                                    return;
+                                                }
+                                                clipboard_session_requested = true;
+                                                clipboard_client_stream_opened = true;
+                                                info!(
+                                                    "panta[{}]: requested clipboard gRPC session={} agent={:#06x}->{:#06x} after ICDF ready",
+                                                    peer,
+                                                    clipboard_session,
+                                                    LOCAL_CLIPBOARD_CONSUMER_AGENT,
+                                                    peer_agent
+                                                );
+                                            }
+                                        } else if status == "Init"
+                                            && let Some(peer_id) = peer_device_id
+                                        {
+                                            if let Err(error) = send_clipboard_icdf(
+                                                &mut sock,
+                                                local_session,
+                                                our_id,
+                                                peer_id,
+                                                "Ready",
+                                            )
+                                            .await
+                                            {
+                                                warn!(
+                                                    "panta[{}]: cannot reply ICDF Ready: {}",
+                                                    peer, error
+                                                );
+                                                return;
+                                            }
+                                            info!(
+                                                "panta[{}]: replied ColorOS 15 clipboard IcdfStatus=Ready",
+                                                peer
+                                            );
+                                        }
+                                        continue;
                                     }
                                     if let Some((topic, key)) = kv_message(&plain) {
                                         if topic == "Oplus_MacConnect"
@@ -3216,13 +4234,20 @@ async fn run_session<F, Fut>(
                                             )
                                             .await
                                             {
-                                                last_clipboard = Some(text);
+                                                info!(
+                                                    "panta[{}]: platform clipboard updated from phone",
+                                                    peer
+                                                );
                                             } else {
                                                 warn!(
                                                     "panta[{}]: platform clipboard write failed",
                                                     peer
                                                 );
                                             }
+                                            // Record the remote generation even when the
+                                            // platform write fails; otherwise polling can
+                                            // echo the same text back to the phone.
+                                            last_clipboard = Some(text);
                                         }
                                         if (key == "switchStatus"
                                             || key == "clipboard_state_active")
@@ -3362,12 +4387,48 @@ async fn run_session<F, Fut>(
                                         ),
                                     }
                                 }
-                                Err(_) => warn!(
-                                    "panta[{}]: session={} GCM tag mismatch ({}B)",
-                                    peer,
-                                    session_id,
-                                    body.len() - 11
-                                ),
+                                Err(_) => {
+                                    if clipboard_provider_session == Some(session_id) {
+                                        for (label, start) in
+                                            [("3..11", 3usize), ("4..12", 4), ("5..13", 5)]
+                                        {
+                                            let Some(seq) = body.get(start..start + 8) else {
+                                                continue;
+                                            };
+                                            let Some((key, iv, aad)) = business_key(
+                                                ksc.as_deref(),
+                                                &client_rc2,
+                                                &server_rc2,
+                                                seq,
+                                            ) else {
+                                                continue;
+                                            };
+                                            let cipher =
+                                                Aes128Gcm::new_from_slice(&key).expect("key");
+                                            let payload = aes_gcm::aead::Payload {
+                                                msg: &body[start + 8..],
+                                                aad: &aad,
+                                            };
+                                            if let Ok(plain) =
+                                                cipher.decrypt(&Nonce::from(iv), payload)
+                                            {
+                                                warn!(
+                                                    "panta[{}]: clipboard provider session={} decrypts with seq at {}: {}",
+                                                    peer,
+                                                    session_id,
+                                                    label,
+                                                    hex(&plain[..plain.len().min(96)])
+                                                );
+                                            }
+                                        }
+                                    }
+                                    warn!(
+                                        "panta[{}]: session={} GCM tag mismatch ({}B)",
+                                        peer,
+                                        session_id,
+                                        body.len() - 11
+                                    )
+                                }
                             }
                         }
                         None => warn!("panta[{}]: no KSC yet, cannot derive business key", peer),
@@ -3400,7 +4461,67 @@ async fn run_session<F, Fut>(
                     // (protocol doc §17.4).
                     let peer_request = parse_create_service_request(&body);
                     let peer_confirm = parse_create_service_confirm(&body);
-                    let replies: Vec<Vec<u8>> = match sub {
+                    let mut replies: Vec<Vec<u8>> = match sub {
+                        0x01 if !clipboard_agent_answered
+                            && service_frame_profile(&body) == Some(CLIPBOARD_SERVICE_PROFILE) =>
+                        {
+                            match peer_request.clone() {
+                                Some(request) => {
+                                    if request.acceptor != LOCAL_CLIPBOARD_CONSUMER_AGENT
+                                        && request.acceptor != LOCAL_CLIPBOARD_PROVIDER_AGENT
+                                    {
+                                        warn!(
+                                            "panta[{}]: clipboard create-service targets unknown agent {:#06x}",
+                                            peer, request.acceptor
+                                        );
+                                        Vec::new()
+                                    } else if request.sessions.is_empty() {
+                                        warn!(
+                                            "panta[{}]: clipboard create-service has no session",
+                                            peer
+                                        );
+                                        Vec::new()
+                                    } else {
+                                        clipboard_agent_answered = true;
+                                        for (session, _) in &request.sessions {
+                                            if !peer_sessions.contains(session) {
+                                                peer_sessions.push(*session);
+                                            }
+                                        }
+                                        let peer_session = request.sessions[0].0;
+                                        if clipboard_provider_session != Some(peer_session) {
+                                            // The phone numbers its frames from 1 in every new
+                                            // session, so an ack held over from the previous
+                                            // session makes each fresh frame look like a
+                                            // duplicate and silently drops the whole channel.
+                                            clipboard_provider_acked_seq = None;
+                                        }
+                                        clipboard_provider_session = Some(peer_session);
+                                        info!(
+                                            "panta[{}]: phone opened clipboard provider session={} agent={:#06x}->{:#06x}",
+                                            peer, peer_session, request.initiator, request.acceptor
+                                        );
+                                        vec![
+                                            create_service_bind(
+                                                request.initiator,
+                                                request.acceptor,
+                                                &request.profile,
+                                            ),
+                                            create_service_confirm(
+                                                request.initiator,
+                                                request.acceptor,
+                                                &request.profile,
+                                                peer_session,
+                                            ),
+                                        ]
+                                    }
+                                }
+                                None => {
+                                    warn!("panta[{}]: malformed clipboard create-service", peer);
+                                    Vec::new()
+                                }
+                            }
+                        }
                         0x01 if !agent_answered => {
                             agent_answered = true;
                             let mut frames = Vec::new();
@@ -3462,14 +4583,64 @@ async fn run_session<F, Fut>(
                             "panta[{}]: peer accepted profile={} status={} sessions={:?}",
                             peer, confirm.profile, confirm.status, confirm.sessions
                         );
-                        if confirm.status == 0 && confirm.sessions.contains(&local_session) {
+                        if confirm.status != 0 {
+                            info!(
+                                "panta[{}]: create-service raw status body={}",
+                                peer,
+                                hex(&body)
+                            );
+                        }
+                        // The phone provider's `onConnectionRequest` returns
+                        // boolean true, which the OAF control layer reports as
+                        // status 1. 0 and 1 both allow the session; only larger
+                        // codes are failures.
+                        if matches!(confirm.status, 0 | 1)
+                            && confirm.profile == CLIPBOARD_SERVICE_PROFILE
+                            && confirm.sessions.contains(&clipboard_session)
+                        {
+                            clipboard_session_confirmed = true;
+                            info!(
+                                "panta[{}]: clipboard gRPC session={} confirmed",
+                                peer, clipboard_session
+                            );
+                            // The official initiator also binds its own agent on the
+                            // session it opened. The phone provider only builds its
+                            // `GrpcServerTransport` after it has seen this frame, so
+                            // omitting it leaves the channel half-open (`accept`
+                            // without `CommonChannel ready`).
+                            if !clipboard_client_bound
+                                && let Some(provider_agent) = peer_clipboard_provider_agent
+                            {
+                                clipboard_client_bound = true;
+                                info!(
+                                    "panta[{}]: bound clipboard consumer agent on session={} \
+                                     (agent={:#06x}->{:#06x})",
+                                    peer,
+                                    clipboard_session,
+                                    LOCAL_CLIPBOARD_CONSUMER_AGENT,
+                                    provider_agent
+                                );
+                                replies.push(create_service_bind(
+                                    provider_agent,
+                                    LOCAL_CLIPBOARD_CONSUMER_AGENT,
+                                    CLIPBOARD_SERVICE_PROFILE,
+                                ));
+                            }
+                        }
+                        if confirm.status == 0
+                            && confirm.profile == "app:unite.oplus.onet"
+                            && confirm.sessions.contains(&local_session)
+                        {
                             local_session_confirmed = true;
                             info!(
                                 "panta[{}]: local unite session={} confirmed",
                                 peer, local_session
                             );
                         }
-                        if confirm.status == 0 && confirm.sessions.contains(&oshare_session) {
+                        if confirm.status == 0
+                            && confirm.profile == "app:oshare.win.agent"
+                            && confirm.sessions.contains(&oshare_session)
+                        {
                             oshare_session_confirmed = true;
                             info!(
                                 "panta[{}]: local oshare session={} confirmed",
@@ -3490,6 +4661,28 @@ async fn run_session<F, Fut>(
                             return;
                         }
                     }
+                    // The phone's own clipboard client opens the OAF stream with
+                    // `[transport(control=1)][0x01 0x00 0x00]` right after the SC
+                    // response. Its `OafCommonChannelServer` only builds the netty
+                    // channel (and therefore `GrpcServerTransport`) once the peer
+                    // client sends the same frame, so mirror it on the session we
+                    // opened as the initiator.
+                    if clipboard_session_confirmed && !clipboard_client_stream_opened {
+                        clipboard_client_stream_opened = true;
+                        let mut open = encode_transport_header(clipboard_session, 1).to_vec();
+                        open.extend_from_slice(&[0x01, 0x00, 0x00]);
+                        if let Err(error) = write_frame(&mut sock, &open).await {
+                            warn!(
+                                "panta[{}]: cannot open clipboard OAF stream: {}",
+                                peer, error
+                            );
+                            return;
+                        }
+                        info!(
+                            "panta[{}]: opened clipboard OAF stream on session={}",
+                            peer, clipboard_session
+                        );
+                    }
                     if !replies.is_empty() {
                         info!("panta[{}]: replied to agent frame sub={:#04x}", peer, sub);
                         if sub == 0x05 && oshare_certificate_sent {
@@ -3498,6 +4691,35 @@ async fn run_session<F, Fut>(
                                 peer, LOCAL_OSHARE_AGENT, peer_oshare_agent
                             );
                         }
+                    }
+                    if let Some(session_id) = clipboard_provider_session
+                        && !grpc_routes.contains_key(&session_id)
+                    {
+                        let route = GrpcRouteHandle::server(
+                            session_id,
+                            grpc_outbound_tx.clone(),
+                            grpc_events_tx.clone(),
+                            params.event_broadcaster.clone(),
+                        );
+                        grpc_routes.insert(session_id, route);
+                        info!(
+                            "panta[{}]: started clipboard gRPC provider on session={}",
+                            peer, session_id
+                        );
+                    }
+                    if clipboard_session_confirmed && !grpc_routes.contains_key(&clipboard_session)
+                    {
+                        let route = GrpcRouteHandle::client(
+                            clipboard_session,
+                            grpc_outbound_tx.clone(),
+                            grpc_events_tx.clone(),
+                            params.event_broadcaster.clone(),
+                        );
+                        grpc_routes.insert(clipboard_session, route);
+                        info!(
+                            "panta[{}]: started clipboard gRPC consumer on session={}",
+                            peer, clipboard_session
+                        );
                     }
                     // The official client opens a dedicated session for the sharing agent.
                     if !oshare_session_opened && matches!(sub, 0x03 | 0x06) {
@@ -3745,6 +4967,7 @@ mod tests {
                 kms: true,
                 cast: true,
                 expand_cast: false,
+                clipboard_icdf: false,
             };
             for step in 0..3 {
                 let value: serde_json::Value = serde_json::from_str(&topics.sync_json()).unwrap();
@@ -3888,15 +5111,18 @@ mod tests {
     }
 
     #[test]
-    fn service_list_matches_the_official_capture() {
-        // Matches the captured Windows service list: four profiles and no
-        // app:clipboardservice; clipboard data in the compared sessions used
-        // the DataBus topic.
+    fn service_list_matches_the_official_capture_and_adds_coloros15_clipboard() {
+        // The first four entries are the official ColorOS 16/17 capture. The
+        // fifth is required for ColorOS 15 capability discovery; unsupported
+        // peers simply omit it from their registration.
         let official = hex_to_vec(
             "00080102000000000473797374656d3a73747265616d7472616e736665723b73797374656d3a66696c657472616e736665723b6170703a756e6974652e6f706c75732e6f6e65743b6170703a6f73686172652e77696e2e6167656e743b",
         );
-        assert_eq!(build_service_list(&SERVICE_PROFILES), official);
+        assert_eq!(build_service_list(&SERVICE_PROFILES[..4]), official);
         assert_eq!(official.len(), 93);
+        assert_eq!(SERVICE_PROFILES.len(), 5);
+        assert_eq!(SERVICE_PROFILES[4], CLIPBOARD_SERVICE_PROFILE);
+        assert_ne!(build_service_list(&SERVICE_PROFILES), official);
     }
 
     #[test]
@@ -3989,6 +5215,41 @@ mod tests {
             "routing block must match the capture"
         );
         assert_eq!(ours.len(), 61 + json.len());
+    }
+
+    #[test]
+    fn grpc_oaf_frame_has_transport_and_plaintext_flag_only() {
+        let payload = b"ICDF\0\0\0\x06\0\x01\x04";
+        let frame = build_grpc_oaf_frame(614, payload).unwrap();
+        assert_eq!(&frame[..2], &encode_transport_header(614, 0));
+        assert_eq!(frame[2], 0);
+        assert_eq!(&frame[3..], payload);
+        assert!(build_grpc_oaf_frame(614, &vec![0; u16::MAX as usize]).is_err());
+    }
+
+    #[test]
+    fn grpc_oaf_business_frame_round_trips_with_gcm() {
+        let ksc = [0x42u8; 16];
+        let client_rc2 = [0x11u8; 8];
+        let server_rc2 = [0x22u8; 8];
+        let payload = b"ICDF\0\0\0\x06\0\x01\x04";
+        let frame =
+            seal_grpc_oaf_frame(614, payload, Some(&ksc), &client_rc2, &server_rc2).unwrap();
+        // `[transport][u16 delivery sequence][0x04][u64 seed][cipher]`
+        assert_eq!(frame[4], 0x04);
+        let (key, iv, aad) =
+            business_key(Some(&ksc), &client_rc2, &server_rc2, &frame[5..13]).unwrap();
+        let cipher = Aes128Gcm::new_from_slice(&key).unwrap();
+        let plain = cipher
+            .decrypt(
+                &Nonce::from(iv),
+                aes_gcm::aead::Payload {
+                    msg: &frame[13..],
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        assert_eq!(plain, payload);
     }
 
     #[test]
@@ -4188,6 +5449,63 @@ mod tests {
         assert!(payload["sub"].as_array().unwrap().iter().any(|topic| {
             topic["dbs_topic_name"] == "Oplus_HeySynergy_PcConnect_SyncNotification_Publisher"
         }));
+    }
+
+    #[test]
+    fn coloros15_icdf_topics_and_payload_match_the_official_client() {
+        let mut topics = BusTopics {
+            clipboard_icdf: true,
+            ..BusTopics::default()
+        };
+        let value: serde_json::Value = serde_json::from_str(&topics.sync_json()).unwrap();
+        let payload = &value["dbs_msg_payload"];
+        assert!(
+            payload["pub"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|topic| { topic["dbs_topic_name"] == CLIPBOARD_ICDF_TOPIC })
+        );
+        assert!(
+            payload["sub"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|topic| { topic["dbs_topic_name"] == CLIPBOARD_ICDF_SUBSCRIBE_TOPIC })
+        );
+        assert_eq!(payload["pub"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["sub"].as_array().unwrap().len(), 4);
+
+        for (status, expected) in [("Init", "Init"), ("Ready", "Ready")] {
+            let message = clipboard_icdf_message(status);
+            // One DBS message carrying the full array; the phone parses it as
+            // `ArrayList<AbilityProfile>` and crashes on a bare object.
+            let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+            assert_eq!(value.as_array().unwrap().len(), 2);
+            assert_eq!(value[0]["key"], "TaskType");
+            assert_eq!(value[0]["value"], "ACROSS_DEVICE_CLIPBOARD");
+            let state = topic_data_json(CLIPBOARD_ICDF_TOPIC, &message);
+            assert_eq!(icdf_status(state.as_bytes()), Some(expected.to_string()));
+        }
+
+        topics.clipboard_icdf = false;
+        let value: serde_json::Value = serde_json::from_str(&topics.sync_json()).unwrap();
+        assert_eq!(value["dbs_msg_payload"]["pub"].as_array().unwrap().len(), 2);
+        assert_eq!(value["dbs_msg_payload"]["sub"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn icdf_status_accepts_a_single_object_payload() {
+        let message = topic_data_json(
+            CLIPBOARD_ICDF_SUBSCRIBE_TOPIC,
+            r#"{"key":"IcdfStatus","value":"Ready"}"#,
+        );
+        assert_eq!(icdf_status(message.as_bytes()), Some("Ready".to_string()));
+        let message = topic_data_json(
+            CLIPBOARD_ICDF_SUBSCRIBE_TOPIC,
+            r#"{"key":"other","value":"Ready"}"#,
+        );
+        assert_eq!(icdf_status(message.as_bytes()), None);
     }
 
     #[test]
@@ -4828,46 +6146,31 @@ mod tests {
     #[test]
     fn receive_filter_accepts_every_confirmed_session() {
         let peer_sessions = [323, 441];
-        assert!(accepts_business_session(
-            323,
-            &peer_sessions,
-            862,
-            true,
-            817,
-            true
-        ));
-        assert!(accepts_business_session(
-            862,
-            &peer_sessions,
-            862,
-            true,
-            817,
-            true
-        ));
-        assert!(accepts_business_session(
-            817,
-            &peer_sessions,
-            862,
-            true,
-            817,
-            true
-        ));
+        let confirmed = ConfirmedBusinessSessions {
+            local: (862, true),
+            oshare: (817, true),
+            clipboard: (701, true),
+        };
+        for session in [323, 862, 817, 701] {
+            assert!(accepts_business_session(session, &peer_sessions, confirmed));
+        }
         assert!(!accepts_business_session(
             862,
             &peer_sessions,
-            862,
-            false,
-            817,
-            true
+            ConfirmedBusinessSessions {
+                local: (862, false),
+                ..confirmed
+            }
         ));
         assert!(!accepts_business_session(
-            777,
+            701,
             &peer_sessions,
-            862,
-            true,
-            817,
-            true
+            ConfirmedBusinessSessions {
+                clipboard: (701, false),
+                ..confirmed
+            }
         ));
+        assert!(!accepts_business_session(777, &peer_sessions, confirmed));
     }
 
     #[test]
@@ -4905,6 +6208,115 @@ mod tests {
             agent_for_profile(&registration, "app:oshare.win.agent"),
             Some(0x1d3a)
         );
+        let services =
+            parse_registered_services(&registration).expect("official registration parses");
+        assert!(services.len() >= 8);
+        assert_eq!(
+            services[0].service_name,
+            "com.heytap.accessory;0689A6EC3591BB5BFA21CD4B7FF8106E;"
+        );
+    }
+
+    #[test]
+    fn clipboard_profile_registration_has_distinct_consumer_and_provider() {
+        let registration = clipboard_profile_registration();
+        let services = parse_registered_services(&registration).expect("valid registration");
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].service_name, "ClipboardConsumer;;");
+        assert_eq!(services[0].agent, LOCAL_CLIPBOARD_CONSUMER_AGENT);
+        assert_eq!(services[0].capabilities, CLIPBOARD_SERVICE_CAPABILITIES);
+        assert_eq!(services[1].service_name, "ClipBoardProvider;;");
+        assert_eq!(services[1].agent, LOCAL_CLIPBOARD_PROVIDER_AGENT);
+        assert_eq!(services[1].capabilities, CLIPBOARD_PROVIDER_CAPABILITIES);
+        assert!(
+            services
+                .iter()
+                .all(|service| service.profile == CLIPBOARD_SERVICE_PROFILE)
+        );
+        assert_eq!(
+            clipboard_service_selection(),
+            hex_to_vec("0008010200000000016170703a636c6970626f617264736572766963653b")
+        );
+        let request = clipboard_service_request(0x2102, 614);
+        let parsed = parse_create_service_request(&request).expect("valid request");
+        assert_eq!(parsed.acceptor, 0x2102);
+        assert_eq!(parsed.initiator, LOCAL_CLIPBOARD_CONSUMER_AGENT);
+        assert_eq!(parsed.profile, CLIPBOARD_SERVICE_PROFILE);
+        assert_eq!(parsed.sessions, vec![(614, 104)]);
+
+        let binds = clipboard_profile_binds();
+        assert_eq!(binds.len(), 2);
+        for (bind, name, agent, capabilities) in [
+            (
+                &binds[0],
+                "ClipboardConsumer;;",
+                LOCAL_CLIPBOARD_CONSUMER_AGENT,
+                CLIPBOARD_SERVICE_CAPABILITIES,
+            ),
+            (
+                &binds[1],
+                "ClipBoardProvider;;",
+                LOCAL_CLIPBOARD_PROVIDER_AGENT,
+                CLIPBOARD_PROVIDER_CAPABILITIES,
+            ),
+        ] {
+            assert_eq!(&bind[..4], &[0x00, 0x08, 0x03, 0x02]);
+            assert!(
+                bind.windows(name.len())
+                    .any(|window| window == name.as_bytes())
+            );
+            assert!(
+                bind.windows(CLIPBOARD_SERVICE_PROFILE.len())
+                    .any(|window| window == CLIPBOARD_SERVICE_PROFILE.as_bytes())
+            );
+            assert!(
+                bind.windows(agent.to_be_bytes().len())
+                    .any(|window| window == agent.to_be_bytes())
+            );
+            assert!(bind.ends_with(&capabilities));
+        }
+    }
+
+    #[test]
+    fn registration_parser_preserves_all_clipboard_handles() {
+        let mut registration = clipboard_profile_registration();
+        registration[8..10].copy_from_slice(&3u16.to_be_bytes());
+        push_registration_entry(
+            &mut registration,
+            "OtherService;;",
+            0x1234,
+            "app:example",
+            [0x01, 0x00, 0x01, 0x00, 0x0a],
+        );
+        let services = parse_registered_services(&registration).expect("valid registration");
+        assert_eq!(clipboard_peer_agents(&services).len(), 2);
+        assert_eq!(
+            clipboard_peer_agents(&services),
+            vec![
+                LOCAL_CLIPBOARD_CONSUMER_AGENT,
+                LOCAL_CLIPBOARD_PROVIDER_AGENT
+            ]
+        );
+        assert!(parse_registered_services(&registration[..registration.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn registration_parser_reads_phone_grouped_clipboard_agents() {
+        let mut body = vec![0x00, 0x08, 0x02, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01];
+        body.extend_from_slice(b"com.coloros.clipboard;digest;\0");
+        body.push(2u8);
+        for (agent, capabilities) in [
+            (0x2101u16, CLIPBOARD_SERVICE_CAPABILITIES),
+            (0x2102u16, CLIPBOARD_PROVIDER_CAPABILITIES),
+        ] {
+            body.extend_from_slice(&agent.to_be_bytes());
+            body.extend_from_slice(CLIPBOARD_SERVICE_PROFILE.as_bytes());
+            body.push(b';');
+            body.extend_from_slice(&capabilities);
+        }
+        let services = parse_registered_services(&body).expect("phone registration parses");
+        assert_eq!(clipboard_peer_agents(&services), vec![0x2101, 0x2102]);
+        assert_eq!(clipboard_peer_provider_agent(&services), Some(0x2102));
     }
 
     #[test]
@@ -4922,6 +6334,25 @@ mod tests {
             agent_for_profile(&registration, "app:clipboardservice"),
             None,
             "the compared Windows sessions did not register a clipboard profile"
+        );
+        // Regression: the official frame repeats `service;; NUL count` groups.
+        // The parser and our generated clipboard frame must agree on that
+        // shape, otherwise the phone drops the group and findPeer returns 10002.
+        let services = parse_registered_services(&registration).expect("official frame parses");
+        assert_eq!(services.len(), 7);
+        assert_eq!(
+            services
+                .iter()
+                .find(|service| service.agent == LOCAL_INITIATOR_AGENT)
+                .map(|service| service.profile.as_str()),
+            Some("app:unite.oplus.onet")
+        );
+        assert_eq!(
+            services
+                .iter()
+                .find(|service| service.agent == LOCAL_OSHARE_AGENT)
+                .map(|service| service.profile.as_str()),
+            Some("app:oshare.win.agent")
         );
     }
 

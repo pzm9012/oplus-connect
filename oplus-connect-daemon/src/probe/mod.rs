@@ -59,6 +59,9 @@ impl Drop for PeerLease {
 
 const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// An SDP heartbeat channel that goes quiet this long is a leaked connection: the
+/// phone pings every few seconds, so nothing legitimate stays silent this long.
+const SDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_FRAME_LEN: usize = crate::scp::codec::SCP_HEADER_LEN + u16::MAX as usize;
 const READ_CHUNK_LEN: usize = 8192;
 const MAX_BUFFER_LEN: usize = MAX_FRAME_LEN + READ_CHUNK_LEN;
@@ -300,7 +303,7 @@ pub(crate) async fn serve_peer(
     let auto_accept = std::env::var("OPLUS_AUTO_ACCEPT")
         .map(|value| value == "1")
         .unwrap_or(false);
-    serve_peer_with_policy(sock, port, peer, state, auto_accept).await;
+    serve_peer_with_policy(sock, port, peer, state, auto_accept, APPROVAL_TIMEOUT).await;
 }
 
 async fn serve_peer_with_policy(
@@ -309,6 +312,7 @@ async fn serve_peer_with_policy(
     peer: std::net::SocketAddr,
     state: crate::state::AppState,
     auto_accept: bool,
+    approval_timeout: std::time::Duration,
 ) {
     info!("probe[{}]: connection from {}", port, peer);
     let (tx, mut rx) = mpsc::channel::<PeerCommand>(8);
@@ -337,18 +341,30 @@ async fn serve_peer_with_policy(
     let mut chunk = [0u8; READ_CHUNK_LEN];
     let mut session = ProbeSession::default();
 
-    let handshake_deadline = tokio::time::Instant::now() + APPROVAL_TIMEOUT;
+    let handshake_deadline = tokio::time::Instant::now() + approval_timeout;
     let mut read_deadline = tokio::time::Instant::now();
     let mut data_connections = JoinSet::new();
+    // The phone opens a dedicated TCP connection to port 10155 for SDP heartbeats
+    // and only sends `PING`/`QUERY` on it. It never performs the SCP handshake, so
+    // the approval deadline must not apply: closing the heartbeat channel makes the
+    // phone tear down every data channel of the session a few seconds later.
+    let mut sdp_channel = false;
+    let mut sdp_last_seen = tokio::time::Instant::now();
     'connection: loop {
         tokio::select! {
             Some(_) = data_connections.join_next(), if !data_connections.is_empty() => {}
-            _ = tokio::time::sleep_until(handshake_deadline), if session.handshake.as_ref().and_then(|server| server.secure_channel()).is_none() => {
+            _ = tokio::time::sleep_until(handshake_deadline), if !sdp_channel && session.handshake.as_ref().and_then(|server| server.secure_channel()).is_none() => {
                 warn!("probe[{}]: handshake or approval timed out for {}", port, peer);
                 break;
             }
             _ = tokio::time::sleep_until(read_deadline), if !buf.is_empty() => {
                 warn!("probe[{}]: incomplete frame timed out for {}", port, peer);
+                break;
+            }
+            // Exempt heartbeat channels from the approval deadline, but not from an
+            // idle timeout: without it a PING-only socket would never be reclaimed.
+            _ = tokio::time::sleep_until(sdp_last_seen + SDP_IDLE_TIMEOUT), if sdp_channel => {
+                warn!("probe[{}]: idle SDP channel closed for {}", port, peer);
                 break;
             }
             Some(command) = rx.recv() => match command {
@@ -432,6 +448,20 @@ async fn serve_peer_with_policy(
                                 warn!("probe[{}]: cannot answer TCP SDP query: {}", port, error);
                                 break 'connection;
                             }
+                            sdp_channel = true;
+                            sdp_last_seen = tokio::time::Instant::now();
+                            buf.drain(..total);
+                            continue;
+                        }
+                        if buf.starts_with(b"PING ") {
+                            let response = crate::discovery::announce::pong_payload();
+                            if let Err(error) = sock.write_all(response.as_bytes()).await {
+                                warn!("probe[{}]: cannot answer TCP SDP ping: {}", port, error);
+                                break 'connection;
+                            }
+                            sdp_channel = true;
+                            sdp_last_seen = tokio::time::Instant::now();
+                            info!("probe[{}]: answered TCP SDP ping", port);
                             buf.drain(..total);
                             continue;
                         }
@@ -603,8 +633,8 @@ fn incoming_len(buf: &[u8]) -> std::io::Result<Option<usize>> {
     if buf.is_empty() {
         return Ok(None);
     }
-    if buf[0] == b'Q' {
-        let prefix = b"QUERY ";
+    if buf[0] == b'Q' || buf[0] == b'P' {
+        let prefix: &[u8] = if buf[0] == b'Q' { b"QUERY " } else { b"PING " };
         let prefix_len = buf.len().min(prefix.len());
         if buf[..prefix_len] != prefix[..prefix_len] {
             return Err(std::io::Error::other("invalid TCP discovery prefix"));
@@ -616,9 +646,10 @@ fn incoming_len(buf: &[u8]) -> std::io::Result<Option<usize>> {
         } else if buf.len() < MAX_QUERY_LEN {
             return Ok(None);
         }
-        return Err(std::io::Error::other("TCP discovery query too large"));
+        return Err(std::io::Error::other("TCP discovery request too large"));
     }
-    if buf[0] != 0x40 || (buf.len() >= 2 && buf[1] & !0x0d != 0x30) {
+    // ColorOS 15 phones use the 0x3030 base magic; ColorOS 16/17 use 0x4030.
+    if (buf[0] != 0x40 && buf[0] != 0x30) || (buf.len() >= 2 && buf[1] & !0x0d != 0x30) {
         return Err(std::io::Error::other("invalid SCP magic"));
     }
     if buf.len() < 4 {
@@ -1102,6 +1133,12 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     async fn start_control() -> (TcpStream, tokio::task::JoinHandle<()>, String, String) {
+        start_control_with_timeout(APPROVAL_TIMEOUT).await
+    }
+
+    async fn start_control_with_timeout(
+        approval_timeout: Duration,
+    ) -> (TcpStream, tokio::task::JoinHandle<()>, String, String) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -1115,6 +1152,7 @@ mod tests {
             peer,
             crate::state::AppState::new(),
             false,
+            approval_timeout,
         ));
         let connection_id = timeout(Duration::from_secs(1), async {
             loop {
@@ -1181,6 +1219,15 @@ mod tests {
         );
     }
 
+    /// First frame captured from a ColorOS 15 Reno10 Pro dialling TCP 10152.
+    fn legacy_coloros15_frame() -> Vec<u8> {
+        const SAMPLE: &str = "30300036000200007b08ad12123408b6d3e2e7fdffffffff0112116163746976655f636f6e6e656374696f6e1a14636f6d2e6865797461702e6163636573736f7279";
+        (0..SAMPLE.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&SAMPLE[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn frame_parser_preserves_partial_frames_and_bounds_discovery() {
         let bytes = hello_frame();
@@ -1190,11 +1237,30 @@ mod tests {
         assert_eq!(incoming_len(&bytes).unwrap(), Some(bytes.len()));
         assert!(incoming_len(&[0x41]).is_err());
         assert!(incoming_len(&[0x40, 0x32]).is_err());
+        assert!(incoming_len(&[0x30, 0x32]).is_err());
+        let legacy = legacy_coloros15_frame();
+        for end in 0..legacy.len() {
+            assert_eq!(
+                incoming_len(&legacy[..end]).unwrap(),
+                None,
+                "legacy prefix {end}"
+            );
+        }
+        assert_eq!(incoming_len(&legacy).unwrap(), Some(legacy.len()));
         let query = b"QUERY / HTTP/1.1\r\n\r\n";
         for end in 0..query.len() {
             assert_eq!(incoming_len(&query[..end]).unwrap(), None);
         }
         assert_eq!(incoming_len(query).unwrap(), Some(query.len()));
+        let ping = b"PING * HTTP/1.1\r\nMAN: \"sdp/1\"\r\nPDID: 50D83BD6E082\r\n\r\n";
+        for end in 0..ping.len() {
+            assert_eq!(
+                incoming_len(&ping[..end]).unwrap(),
+                None,
+                "ping prefix {end}"
+            );
+        }
+        assert_eq!(incoming_len(ping).unwrap(), Some(ping.len()));
         let mut oversized = b"QUERY ".to_vec();
         oversized.resize(MAX_QUERY_LEN, b'x');
         assert!(incoming_len(&oversized).is_err());
@@ -1227,6 +1293,86 @@ mod tests {
                 .unwrap()
                 .is_response
         );
+        drop(client);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn answers_tcp_sdp_ping_with_pong() {
+        let _guard = PEER_TEST_LOCK.lock().await;
+        let (mut client, task, _, _) = start_control().await;
+        client
+            .write_all(b"PING * HTTP/1.1\r\nMAN: \"sdp/1\"\r\nPDID: 50D83BD6E082\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), async {
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = client.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&chunk[..n]);
+                if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("PONG * HTTP/1.1\r\n"), "{text}");
+        assert!(text.contains("MAN: \"sdp/1\""), "{text}");
+        assert!(text.contains("PDID: "), "{text}");
+        drop(client);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sdp_ping_channel_survives_the_approval_deadline() {
+        let _guard = PEER_TEST_LOCK.lock().await;
+        let approval_timeout = Duration::from_millis(200);
+        let (mut client, task, _, _) = start_control_with_timeout(approval_timeout).await;
+        let ping = b"PING * HTTP/1.1\r\nMAN: \"sdp/1\"\r\nPDID: 50D83BD6E082\r\n\r\n";
+
+        for round in 0..2 {
+            client.write_all(ping).await.unwrap();
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(1), async {
+                let mut chunk = [0u8; 256];
+                loop {
+                    let n = client.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    response.extend_from_slice(&chunk[..n]);
+                    if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let text = String::from_utf8(response).unwrap();
+            assert!(
+                text.starts_with("PONG * HTTP/1.1\r\n"),
+                "round {round}: {text}"
+            );
+            // Outlive the approval deadline with a heartbeat-only channel.
+            tokio::time::sleep(approval_timeout + Duration::from_millis(100)).await;
+            assert!(
+                !task.is_finished(),
+                "round {round}: ping channel was closed"
+            );
+        }
+
         drop(client);
         timeout(Duration::from_secs(1), task)
             .await
@@ -1528,6 +1674,7 @@ mod tests {
             peer,
             crate::state::AppState::new(),
             false,
+            APPROVAL_TIMEOUT,
         ));
         timeout(Duration::from_secs(1), async {
             while !has_peer(&peer_ip).await {

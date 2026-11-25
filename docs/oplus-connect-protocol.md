@@ -1,8 +1,8 @@
 # OPLUS 互联：跨端协议与实现状态
 
-最后更新：2026-11-02  
-目标设备：一加 15T / PLZ110（ColorOS 17）、OPPO Pad Mini / OPD2515（Android 17）  
-官方客户端：OPPO 互联 17.20.3  
+最后更新：2026-11-25
+目标设备：一加 15T / PLZ110（ColorOS 17）、OPPO Pad Mini / OPD2515（Android 17）、OPPO Reno10 Pro / PHV110（ColorOS 15）
+官方客户端：OPPO 互联 17.20.3 / 跨屏互联 14.0.6.190
 本文是协议、逆向结论和当前实现状态的唯一入口。原始 pcapng、logcat、二进制和一次性实验输出保留在 `analysis/` 与 `windows-protocol-evidence/`，不复制进本文。
 
 ---
@@ -21,7 +21,10 @@
 8. 业务密文是 AES-128-GCM；key/IV/AAD 来自 `HMAC-SHA512(KSC, client_rc2 || server_rc2 || frame[3..11])` 的前 16/12/20 字节。
 9. session 每次业务连接重新分配；agent handle 在同一服务端进程内跨重连、甚至删除配对后仍稳定。两者不是同一编号空间。
 10. Linux 剪贴板双向同步已实现：`arboard` 读写系统剪贴板，远端写入不回环发送；
-    daemon 已在 OPD2515 平板和一加 15T / PLZ110 上完成双向真机验收，两个方向都真正写入系统剪贴板。
+    ColorOS 16/17 走 `Oplus_MacConnect` DBS，并已在 OPD2515 平板和一加 15T / PLZ110
+    上完成双向真机验收。ColorOS 15 走 `app:clipboardservice`（gRPC over OAF），
+    协议由官方 14.0.6.190 二进制静态确认；Rust 实现在 OPPO Reno10 Pro（ColorOS 15）
+    上已完成 PC→手机、手机→PC 双向真机验收（单次连接长时间运行稳定）。
 11. OPD2515 的官方客户端与 Rust daemon 使用不同 endpoint、device id、agent
     handle 和每连接 session，但协议结构相同。
 12. DBR 头 `9..17` 还是 8 字节 delivery sequence。接收端按它做重放去重；
@@ -45,6 +48,7 @@
 | PC→手机 session 建立 | 成功 | 成功；OPD2515 `203`、PLZ110 `211` 均被 `status=0` 确认 |
 | PC→手机 clipboard 落地 | 成功 | 成功（OPD2515、PLZ110） |
 | 手机→PC clipboard 落地 | 成功 | 成功（OPD2515、PLZ110） |
+| ColorOS 15 clipboard gRPC | 成功（14.0.6.190） | 已实现并在 Reno10 Pro 上双向验收 |
 | 手机→PC notification 落地 | 成功 | 成功；Linux D-Bus 展示标题、正文和 PNG 图标（PLZ110） |
 
 ### 0.3 当前审查结论
@@ -169,6 +173,18 @@ NS: scp.device
 
 当前 harness 已在 `probe` 中加入这条处理。若没有它，手机会连接 `10150` 后被当成非法 SCP 帧并在 5 秒后断开。
 
+数据通道建立后，手机还会向控制端口（实测 `10155`）发 SDP 心跳：
+
+```text
+PING * HTTP/1.1
+MAN: "sdp/1"
+PDID: <phone PDID>
+```
+
+PC 必须在原连接上回 `PONG * HTTP/1.1`（至少带 `MAN: "sdp/1"` 和 PC 的
+`PDID`）。不回或直接关闭连接，手机会认为 PC 已消失，并在约 0.1 秒后关闭刚
+建立的 panta 数据通道。
+
 ### 2.3 PDID 缓存
 
 手机会按 `PDID` 缓存设备。用官方 PDID 重新起 harness 时，手机可能把新设备当作“旧的已连接设备”过滤掉，只发 UDP/TCP QUERY，不发起新的 SCP。
@@ -235,12 +251,16 @@ business   | 0x01
 头部关键常量：
 
 ```text
-raw0         0x40
+raw0         0x40 (ColorOS 16/17) / 0x30 (ColorOS 15, Reno10 Pro 实测)
 raw1 base    0x30
 header len   12
 tail         7b 08 <varint command>
 command      active_connection = 2349
 ```
+
+`raw0` 与 `raw1` 的 base 共同构成 16 bit magic：ColorOS 16/17 为
+`0x4030`，ColorOS 15 为 `0x3030`；两者其余头部与载荷布局相同。解码同时
+接受这两种 magic，不把 `raw0` 固定为 `0x40`。
 
 `flags` 常见为 `0x0002`（请求）或 `0x0000`（超时/错误）；
 `reserved` 实测为 `0x0000`。
@@ -945,6 +965,255 @@ harness 已能：
 
 唯一允许固定的协议常量是 topic 名、`DATA_u8MsgType=52` 以及已由实验确认的
 route block 形状；其中设备能力相关 topic 集合仍应按对端能力选择。
+
+### 8.5 ColorOS 15：`app:clipboardservice`（gRPC over OAF）
+
+ColorOS 15 Reno10 Pro 的连接已经通过 SCP `0x3030` 与 SDP PING/PONG 修复建立，但它
+不使用 ColorOS 16/17 的 `Oplus_MacConnect.clipboard_data` DBS 通道。官方 Windows
+客户端 `PC_Connect_14.0.6.190_1023_Release.exe`（MD5
+`d897575e05f5535e0b7ae1793a0082de`）的 `HeySynergyFun.dll` 静态分析确认了另一条
+剪贴板通道：
+
+```text
+OAF service profile  app:clipboardservice
+gRPC service          ClipBoardService
+  /ClipBoardService/copyToClip   client streaming
+  /ClipBoardService/getClipData  server streaming
+```
+
+真实 protobuf 只有：
+
+```protobuf
+message ClipData {
+  bytes data = 1; // UTF-8 纯文本，不是 JSON
+}
+```
+
+`getClipData` 请求与 `copyToClip` 响应使用空消息。C# 主程序的 `ClipData` 生成类
+`WriteTo` 对字段 1 写 tag `0x0a`，`ClipDataRedef.data` 为 `byte[]`；native
+`ClipboardRpcImpl` 直接序列化该消息，并把字段 1 的字节作为纯文本回调给主程序。
+因此不能套用其他版本 DBS `clipboard_data.value` 的 JSON 结构。
+
+OAF transport 在 gRPC 消息外增加了一层 `ICDF` 封装：
+
+```text
+0..3    ASCII "ICDF"
+4..7    BE32 size = body length + 3
+8..9    BE16 stream id
+10      u8 command
+11..    command body
+```
+
+`size + 8` 是一个完整 `ICDF` 帧的总长度。`ICDF` 帧可以跨多个 OAF payload 到达，
+也可以与下一个帧合并，必须按字节流重组。**这一层不是 HTTP/2**：`command` 是 ICDF
+自己的操作码（`0x0f` RPC 配置、`0x07` head、`0x08` data、`0x09` half-close、`0x0a`
+cancel，服务端 `0x02/0x03/0x04`），详见下面「ICDF 是自定义的流复用层」。早期按
+HTTP/2 帧类型填 `command` 的实现会被手机判为非法命令而丢弃。
+
+PC→手机方向的载荷是**明文** `[transport][0x00][ICDF…]`；手机→PC 方向仍是
+`[transport][00 01 04][u64 序号][AES-128-GCM 密文]`，两个方向不对称。
+
+实现按手机 `0x0008 sub=0x02` registration 中是否出现 `app:clipboardservice` 决定
+是否启用该通道，不按 OS 版本字符串猜测。
+
+**2026-11-25 更正：ColorOS 16 也会声明该 profile**。OPPO Find X6 Pro
+（PGEM10 / Android 16 / ColorOS V16.0.0）的注册里同样出现剪贴板 agent，
+gRPC 通道会照常建立（`phone opened clipboard provider session=719`、
+`clipboard gRPC consumer session=66 ready`）。因此**不能**用“是否声明 profile”
+区分新旧两套剪贴板路径，真正区分的是手机随后经 DBS 下发的剪贴板开关：
+
+- `clipboard_state_active` / `switchStatus` 置 `clipboard_enabled = true`
+  （ColorOS 16/17）→ 剪贴板走 DBS，gRPC 通道只保持连接；
+- 该开关始终为 false（ColorOS 15，实测四轮日志均为 0 次）→ 剪贴板走 gRPC。
+
+据此，`IcdfStatus=Ready` 轮询只在 `!clipboard_enabled` 时运行。否则每发一次 Ready，
+ColorOS 16 手机就把自己的剪贴板再推一遍：实测约 1 分钟内本机剪贴板被重复写入 25 次
+（日志 `clipboard[719]: remote text (11B): …` 每 2–3 秒一条）。修复后同一场景
+Ready 轮询 0 次、重复写入 0 次，双向仍由 DBS 正常同步。
+
+开关：`OPLUS_CLIPBOARD_GRPC=0` 会让实现忽略该 profile，整条 gRPC 剪贴板通道（profile
+advertise、ICDF topic、`IcdfStatus=Init/Ready`、会话创建）全部不启用，剪贴板继续走
+DBS；默认开启。用于 ColorOS 16/17 或同时声明该 profile 的机型出现回归时回退。
+
+对 ColorOS 16/17 的干扰面（代码级核对）：
+- `bus_topics.clipboard_icdf` 为 false 时，ICDF 相关的收发、topic lease、会话请求都不执行；
+- 收包处业务帧判定新增的 `body[4] == 0x04` 分支只对 session > 4 的数据会话生效，
+  而 `0x0008`/`0x0004` 等明文控制帧走保留会话 1/2，legacy DBS 密文帧本来就命中
+  `body[2] & 0x04`，自建 DBS 帧 `body[4]` 固定为路由字 `0x05`；
+- 新增的 `DBR_DELIVERY_SEQUENCE` 只被 `seal_grpc_oaf_frame` 使用，DBS 帧排序不受影响；
+- `probe` 的 SDP 心跳豁免对全部机型生效，属于修复（原先 120 秒后误关心跳连接）。
+
+#### Reno10 Pro（ColorOS 15）真机已确认
+
+- **ICDF Init 必须是单个 JSON 数组**。官方 Windows `NotifyPhoneInitIcdf` 把
+  `List<DataBusMessage>`（`[JsonProperty("key")]` / `[JsonProperty("value")]`）序列化后
+  一次性发布到 `Oplus_HeySynergy_PadConnect_CastMaterial`：
+  `[{"key":"TaskType","value":"ACROSS_DEVICE_CLIPBOARD"},{"key":"IcdfStatus","value":"Init"}]`。
+  按对象逐条发送会让手机 `CastMaterialReadRunnable` 的 Gson 反序列化抛
+  `Expected BEGIN_ARRAY but was BEGIN_OBJECT`，`com.oplus.linker` 每 3 秒崩溃重启一次。
+  改为数组后手机日志为 `ReadRunnable taskType: ACROSS_DEVICE_CLIPBOARD`、
+  `FileShareEngineService: remote clipboard init, clipSwitchState: true`，并执行
+  `ICDFSceneManager` 的 clipboard scene。
+- **10155 的 PING 连接是独立心跳通道**。手机在数据通道建立后另开一条 TCP 到 10155，
+  只发 `PING`/`QUERY`，从不做 SCP 握手。不能套用 120 秒的 approval 超时关闭它：
+  一旦关闭，手机会在数秒内关闭该会话的全部数据通道。`probe::serve_peer_with_policy`
+  在识别到 PING/QUERY 后不再应用 handshake deadline。
+
+#### ICDF 是自定义的流复用层，不是裸 HTTP/2（2026-11-25 新结论）
+
+真机日志与 `com.oplus.linker` 的 `grpcchannel/inner/*` 反编译共同确认：OAF 上的
+gRPC 并不直接搬运 HTTP/2 帧。gRPC 帧被再包一层 ICDF 命令流：
+
+```text
+ICDF 帧 = "ICDF" | BE32 size(= 3 + bodyLen) | BE16 streamId | u8 cmd | cmd body
+```
+
+`inner/a.d(int streamId, byte cmd, byte[] body, boolean prefix)` 就是编码器
+（`size = 3 + bodyLen`，可选 4 字节前缀）。命令字（来自 `inner/j` 的构造点和
+`cmd_*` 字符串）：
+
+| cmd | 方向 | 含义 |
+| --- | --- | --- |
+| `0x0f` | client→server | RPC method 配置（HTTP/2 之前，stream 0） |
+| `0x07` | client→server | HEAD / 创建 stream（携带请求头） |
+| `0x08` | client→server | DATA（body 以 varint seqNo 开头，见 `inner/a.j`） |
+| `0x09` | client→server | half-close |
+| `0x0a` | client→server | cancel/close（带 grpc status） |
+| `0x02` | server→client | DATA |
+| `0x03` | server→client | header/trailer |
+| `0x04` | server→client | close（带 status） |
+
+手机 server 侧 `GrpcServerTransport` 收到未知 streamId 时只接受 cmd `0x07` 或
+`0x0f`；其余（包括把 HTTP/2 帧类型当 cmd 用的 `0x00/0x01/0x04/0x0a`）会记录
+`ICDF.GrpcServerTransport: onRecv, streamId N, command M` 并丢弃。
+
+**PC→手机必须发裸 ICDF**。此前把所有 ICDF 字节都套上 DBS 业务加密
+（`[transport][u16 送达序号][0x04][seed][AES-GCM]`）时，手机
+`ICDF.PacketAssemble` 对每帧报 `invalid msg header flag`，且标志值按
+`0x00040000 + k·0x01000000` 递增——正好等于把送达序号的低字节当成 ICDF 头起点的
+错位值。改为
+
+```text
+[transport][0x00][ICDF 帧 …]
+```
+
+后 PacketAssemble 立即通过，手机开始按 streamId 解析（日志变为
+`ICDF.GrpcServerTransport: onRecv, streamId 0/1, command …`）。因此 PC→手机方向
+在 gRPC 会话上是**明文 ICDF**，手机→PC 方向仍是
+`[transport][0x00 0x01][0x04][u64 送达序号][AES-GCM 密文]`，两个方向不对称。
+
+#### OAF stream 打开帧（2026-11-25 新结论）
+
+手机自己的 clipboard client 在 `create-service`（`0x0004 sub=0x01`）之后**立刻**
+发送一条控制帧：
+
+```text
+[transport(control=1)][0x01 0x00 0x00]
+```
+
+在 `sessionId == info[0].sessionId` 上发送。缺少它时手机 provider 只记录
+`ICDF.OafCommonChannelServer: accept 7831` 就再无下文；补上后手机才会继续
+`GrpcServerTransport` 的收发（能看到 `onRecv`）。另外手机侧的
+`create-service` 会带 **2 条 info**（第二条 channel `0x0104/0x0105` 是 stream
+通道），PC 侧向手机发起时也应按同样形状发送。
+
+#### 仍未完成（2026-11-25）
+
+- **gRPC 承载层已改为 ICDF 命令流（2026-11-25 完成，PC→手机真机跑通）**。
+  `clipboard/oaf.rs` 新增 `run_icdf_client` / `run_icdf_server`：
+  client 依次发 `0x0f` RPC 配置、`0x07` head、`0x08` data、`0x09` half-close；
+  server 回 `0x01` head、`0x02` data、`0x03` close。真机日志：
+  `recv cmd_server_recv_head, methodFullName = ClipBoardService/copyToClip`、
+  `ServerStream create, streamId 1`、`recv cmd_server_recv_half_close`、
+  `[ClipBoardServiceImpl] copyToClip`、`copyToClip: onCompleted/shutdown`，
+  随后 `[ClipBoardServiceHelper] copyPureTextToClip` 与
+  `onPrimaryClipChanged: dispatch clipString=<PC 文本>`，即手机系统剪贴板已被写入。
+  两个细节：
+  * DATA 的 body 是 `BE32 seqNo | BE32 length | 裸 protobuf`；再套 gRPC 5 字节前缀
+    会让手机报 `Protocol message contained an invalid tag (zero)`。
+  * head 的 body 是 `BE32 len + method | BE32 count + 每项(BE32 len + bytes) ×2 |
+    BE32 len + authority`；手机回包用 `0x01` head（`grpc-encoding: identity` 等）。
+- **手机→PC 已打通（2026-11-25 真机验证）**。两个修复：
+  * 手机 `IcdfStatus=Ready` 之后会 `execute 30 → sendClipToRemote → ClipBoardConsumerImpl.copyToClip`
+    并通过 ICDF 命令流发来 `head(0x07)/data(0x08)/half-close(0x09)`。
+    PC 侧 `run_icdf_server` 解析出 `ClipBoardService/copyToClip` 与 ClipData
+    后写入本地剪贴板（`wl-paste` 得到手机文本）。
+  * **加密帧 layout 判定错误**：`[transport][u16 送达序号][0x04][u64 种子][密文]`
+    里的送达序号会超过 `0x00ff`。基线代码按 legacy DBS 布局判定
+    （`body[2] & 0x04` 表示业务帧、种子取 `body[3..11]`、密文取 `body[11..]`），
+    ColorOS 15 的帧因此被误判：序号 < `0x0100` 时 `body[2]` 恰为 `0x00`，整帧
+    不被识别为业务帧而丢弃；加了 `body[3] == 0x01` 这类中间启发式后，序号 ≥
+    `0x0100` 的帧又会按错误偏移解密，日志表现为 `GCM tag mismatch` +
+    `decrypts with seq at 5..13` 的告警。正确的判据是加密标记恒在索引 4：
+    `body[4] == 0x04` → 种子 `5..13`、密文 `13..`；`body[2] & 0x04` 仍保留给
+    ColorOS 16/17 的 legacy DBS 布局。
+  * 排障：该 bug 的触发计数是**入站**帧的送达序号（`body[2..4]`），不是本端
+    `next_delivery_sequence` 的出站计数；出现 `GCM tag mismatch` 并伴随
+    `decrypts with seq at …` 时应先怀疑 layout 判定。
+  * 手机→PC 的触发开关 `OPLUS_CLIPBOARD_READY_REPEAT_SECS`：默认 2 秒重发一次
+    `IcdfStatus=Ready`（手机侧 `isClipDataRepeat` 去重，内容不变不重发）；
+    设为 `0` 可关闭。
+
+
+
+#### DBS BlockAck 与送达序号（2026-11-25 已确认）
+
+- 控制帧负载格式（2026-11-25 真机定案）：ACK 是 **3 字节** `[0x01][seq_hi][seq_lo]`，
+  用 control=1 的 transport 头发送，`seq` 取对端帧里的序号（帧内 `body[2..4]`，
+  跨连接递增、不是从 0 开始，实测出现过 23/24/25）。
+  * 直接证据：手机对本端发送的每个 RPC（head/data/half-close）都会回
+    `01 00 00` / `01 00 03` / `01 00 05` 这样的 3 字节控制帧，即"已收到 seq N"。
+  * 早前按 `[0x02][count][(start,end)…]` 编码（6 字节）时手机不认，BlockAck 计时器
+    每 10 秒报 `PTC.DATATRANS.d: Timer expired for BlockAck, sess:<sid>`，约 100 秒
+    后 `RETRY ATTEMPTS Exhausted` → `CONNECTION_LOST_RETRANSMISSION_FAILED`，
+    整条数据通道被 reset（表现为每 ~100 秒掉线重连）。
+  * 改成 3 字节形式并按帧重发（含重传）后：手机不再报 BlockAck 超时，连续 2 分钟
+    以上 0 次掉线，且双向同步正常。
+- 手机对响应流的结束命令是 **`0x03`**（close）。客户端若只把 `0x04` 当 close，会让
+  `active` 永久占用，后续 RPC 全部被丢弃（表现为第二条复制没有反应）。
+
+#### 手机→PC 业务帧与 ICDF 控制帧（2026-11-25 新增）
+
+- 手机的 clipboard 通道帧是 `00 01 04 <seq u64> <AES-128-GCM 密文>`，比 PC 的
+  `04 <seq u64> <密文>` 多一个 message-type/flags 字节对。按 `04 seq` 解会 GCM 失败，
+  帧被丢弃；按 `00 01 04` 解析后明文为
+  `ICDF <len> 0f <count> <methodLen> "ClipBoardService/copyToClip" <type> <channel> ...`。
+- ICDF type `0x0f` 是手机 SDK 在 HTTP/2 之前发送的 RPC method 表
+  （`grpcchannel/inner/a.d(..., 15, body, false)`，body = `count u32` +
+  `methodLen u32` + method + `rpcType u16` + `channel u16` + flags）。它不是 HTTP/2
+  帧，必须先识别并跳过，否则 provider route 会在 gRPC preface 到达前报
+  `invalid HTTP/2 frame` 并关闭。
+
+#### `0x0008 sub=0x02` 的 group 结构（2026-11-25 修正）
+
+官方帧的每个 service group 是 `serviceName;;` `00` `count(u8)`，随后 `count` 组
+`agent(u16) profile ';' caps[5]`；`PROFILE_REGISTRATION` 的 299 字节即为此形状。
+此前的 clipboard 注册漏掉了 `count`，手机把后续字节整体错位解析并丢弃该 group：
+`0x0008 sub=0x02` 与 `0x0008 sub=0x01` 都成功，但 `findPeer(app:clipboardservice)`
+永远返回 `10002 / peerAgents=null`，手机框架日志为
+`requestedProfileId:app:clipboardservice not found`。修正后手机日志变为
+`Found a service :app:clipboardservice,appName:ClipBoardProvider`、
+`onFindPeerAgentsResponse: result=0, peerAgents=[... containerId:ClipBoardProvider]`、
+`onConnectionStateChanged: CONNECTION_SUCCESS`、`invokeStatusListener: initSuccess`，
+并主动向 PC provider 发起 `create-service`（agent `0x4810 -> 0x1e96`）。
+
+该通道已在 OPPO Reno10 Pro（ColorOS 15）真机双向验收：PC→手机的 marker 为手机日志
+`[ClipBoardServiceManager] onPrimaryClipChanged: dispatch clipString=<文本>`，
+手机→PC 的 marker 为 PC 侧 `wl-paste` 读到手机文本。
+
+#### 单条消息的失败边界（2026-11-26）
+
+OAF 帧长度前缀是 `u16`，所以一条 ICDF 消息最多
+`65535 - (2 + 1 + 11 + 8) = 65513` 字节（transport 2 + type 1 + ICDF 头 11 +
+data 体头 8）。超过上限的 `copyToClip` 载荷如果照常下发，
+`build_grpc_oaf_frame` 会返回 `OAF gRPC frame too large` 并丢弃该帧：手机的 RPC
+永远等不到回复、PC 侧 stream 一直占着 `active`，之后所有剪贴板写入都被静默排队。
+现在在 ICDF 层直接拒绝这条消息（`warn` + 丢弃，路由保持可用），不再让它进入
+帧层。
+
+同理，`ClipData` 解不出 UTF-8 或 protobuf 非法（例如手机推来非文本剪贴板）时只
+跳过这一条消息，不再让整条路由以 `Err` 退出——路由退出会发 `GrpcEvent::Closed`
+并清掉 provider session，剪贴板要等到重连才恢复。
 
 ---
 

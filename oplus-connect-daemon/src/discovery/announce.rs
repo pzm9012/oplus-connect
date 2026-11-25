@@ -80,6 +80,17 @@ pub fn announce_payload_for(connect_port: u16, virtual_ip: &str) -> String {
     )
 }
 
+/// Reply to the phone's `PING * HTTP/1.1` liveness probe sent to a control
+/// port. The request only carries `MAN` and the phone's `PDID`, so the reply
+/// mirrors those and identifies this PC.
+pub fn pong_payload() -> String {
+    let pdid = crate::net_utils::pdid();
+    format!(
+        "PONG * HTTP/1.1\r\nMAN: \"sdp/1\"\r\nPDID: {}\r\n\r\n",
+        pdid.to_uppercase()
+    )
+}
+
 /// Convenience wrapper for callers that do not know the peer link yet.
 pub fn announce_payload(connect_port: u16) -> String {
     let virtual_ip = std::env::var("OPLUS_VIRTUAL_IP")

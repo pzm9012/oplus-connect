@@ -22,6 +22,9 @@
 //! ```
 
 pub const SCP_MAGIC: u16 = 0x4030;
+/// Base magic used by ColorOS 15 phones (observed on a Reno10 Pro). The rest of the
+/// 12-byte header and the payload layout are identical to [`SCP_MAGIC`].
+pub const SCP_MAGIC_LEGACY: u16 = 0x3030;
 pub const SCP_HEADER_LEN: usize = 12;
 pub const CMD_ACTIVE_CONNECTION: u64 = 2349;
 
@@ -102,7 +105,7 @@ impl ScpFrame {
         let is_response = raw & 0x04 != 0;
         let is_encrypted = raw & 0x08 != 0;
         let is_business = raw & 0x01 != 0;
-        if raw & !0x0d != SCP_MAGIC {
+        if raw & !0x0d != SCP_MAGIC && raw & !0x0d != SCP_MAGIC_LEGACY {
             return Err(ScpError::BadMagic(raw));
         }
         let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
@@ -283,6 +286,8 @@ mod tests {
 
     const SAMPLE_ACTIVE_CONNECTION: &str = "40300030000200007b08ad12122e08e88b9d4d12116163746976655f636f6e6e656374696f6e1a14636f6d2e6865797461702e6163636573736f7279";
     const SAMPLE_TIMEOUT_ERROR: &str = "4030004c000000007b08ad1208ffff03124608e98b9d4d10d2131a3c54696d6564206f75742077616974696e6720666f722035303030206d73205b54696d656f757443616e63656c6c6174696f6e457863657074696f6e5d";
+    /// First frame captured from a ColorOS 15 Reno10 Pro dialling TCP 10152.
+    const SAMPLE_COLOROS15_ACTIVE_CONNECTION: &str = "30300036000200007b08ad12123408b6d3e2e7fdffffffff0112116163746976655f636f6e6e656374696f6e1a14636f6d2e6865797461702e6163636573736f7279";
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -299,6 +304,20 @@ mod tests {
             assert_eq!(frame.encode(), raw, "re-encoding must be byte identical");
             assert_eq!(frame.command(), Some(CMD_ACTIVE_CONNECTION));
         }
+    }
+
+    #[test]
+    fn decodes_coloros15_legacy_magic() {
+        let raw = hex(SAMPLE_COLOROS15_ACTIVE_CONNECTION);
+        let frame = ScpFrame::decode(&raw).expect("ColorOS 15 frame must decode");
+        assert_eq!(frame.command(), Some(CMD_ACTIVE_CONNECTION));
+        assert_eq!(frame.payload.len(), 54);
+        assert!(!frame.is_response);
+        assert!(!frame.is_encrypted);
+        assert!(!frame.is_business);
+        let event = TopicEvent::decode(&frame.payload).expect("topic event must parse");
+        assert_eq!(event.topic, "active_connection");
+        assert_eq!(event.package, "com.heytap.accessory");
     }
 
     #[test]

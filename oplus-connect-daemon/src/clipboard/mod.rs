@@ -1,6 +1,8 @@
 use crate::{platform::clipboard, state::AppState};
 use tracing::info;
 
+pub mod oaf;
+
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
 pub struct ClipboardSync {
